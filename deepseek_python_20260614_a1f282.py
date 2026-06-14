@@ -155,24 +155,33 @@ def vcp_math_check(data):
 
 # ========== 主掃描函數 ==========
 def full_scan():
-    """執行完整漏斗篩選"""
+    """執行完整漏斗篩選（優化版）"""
     start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     stocks = get_all_stocks()
     total = len(stocks)
     print(f"總股票數: {total}")
     
-    # 第一層：趨勢模板（平行處理）
+    # ✅ 分批處理，每批 50 檔，避免記憶體爆掉
+    BATCH_SIZE = 50
     layer1_results = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(fetch_daily, sid, start): sid for sid in stocks}
-        for future in as_completed(futures):
-            sid = futures[future]
-            try:
-                df = future.result()
-                if minervini_check(df):
-                    layer1_results.append((sid, df))
-            except:
-                pass
+    
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch = stocks[batch_start:batch_start + BATCH_SIZE]
+        print(f"處理批次 {batch_start//BATCH_SIZE + 1}/{(total//BATCH_SIZE)+1} ({len(batch)} 檔)")
+        
+        with ThreadPoolExecutor(max_workers=10) as executor:  # 降低並行數
+            futures = {executor.submit(fetch_daily, sid, start): sid for sid in batch}
+            for future in as_completed(futures, timeout=30):  # 加入超時
+                sid = futures[future]
+                try:
+                    df = future.result(timeout=10)  # 單檔超時
+                    if minervini_check(df):
+                        layer1_results.append((sid, df))
+                except Exception as e:
+                    print(f"  {sid} 失敗: {e}")
+        
+        # 釋放記憶體
+        time.sleep(1)  # 批次間休息一秒
     
     layer1_count = len(layer1_results)
     print(f"第一層通過: {layer1_count}")
