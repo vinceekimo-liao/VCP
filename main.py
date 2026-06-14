@@ -1,3 +1,15 @@
+import subprocess
+import sys
+
+def install_package(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import finmind
+except ImportError:
+    install_package("FinMind==1.6.6")
+    import finmind
+    
 import finmind
 import pandas as pd
 import numpy as np
