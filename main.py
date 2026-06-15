@@ -4,6 +4,10 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import glob
+print("=== 搜尋 finmind ===")
+for path in glob.glob("/opt/render/project/src/.venv/lib/python*/site-packages/finmind"):
+    print(f"找到: {path}")
 # 強制設定 site-packages 路徑
 sys.path.insert(0, "/opt/render/project/src/.venv/lib/python3.11/site-packages")
 
