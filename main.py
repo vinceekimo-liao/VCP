@@ -1,30 +1,15 @@
 import os
-import sys
-import subprocess
-
-# ============================================================
-# 確保 FinMind 可被載入
-# ============================================================
-try:
-    import finmind
-except ImportError:
-    # 安裝 FinMind 到當前環境
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "FinMind", "--no-cache-dir"])
-    # 重新載入 site-packages
-    import site
-    from importlib import reload
-    reload(site)
-    # 再次嘗試 import
-    import finmind
-
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# ✅ 正確 import FinMind
+from FinMind.data import DataLoader
 
 app = FastAPI()
 
@@ -36,10 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from fastapi import FastAPI
-
-app = FastAPI()
-
 @app.get("/")
 def root():
     return {"message": "Hello Render + FinMind"}
@@ -47,39 +28,55 @@ def root():
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
 def get_all_stocks():
-    api = finmind.FinMind(token=FINMIND_TOKEN)
-    info = api.get("TaiwanStockInfo")
+    api = DataLoader()
+    if FINMIND_TOKEN:
+        api.login_by_token(FINMIND_TOKEN)
+    info = api.taiwan_stock_info()
     info = info[(info["type"] == "Common Stock") & (info["stock_id"].str.len() == 4)]
     return info["stock_id"].tolist()
 
 def fetch_daily(sid, start_date):
-    api = finmind.FinMind(token=FINMIND_TOKEN)
+    api = DataLoader()
+    if FINMIND_TOKEN:
+        api.login_by_token(FINMIND_TOKEN)
     try:
-        data = api.get("TaiwanStockPrice", data_id=sid, start_date=start_date, end_date=datetime.today().strftime("%Y-%m-%d"))
-        if data.empty: return None
+        data = api.taiwan_stock_price(
+            stock_id=sid,
+            start_date=start_date,
+            end_date=datetime.today().strftime("%Y-%m-%d")
+        )
+        if data.empty:
+            return None
         data["date"] = pd.to_datetime(data["date"])
         data.sort_values("date", inplace=True)
         data.set_index("date", inplace=True)
         return data
-    except: return None
+    except:
+        return None
 
 def minervini_check(data):
-    if data is None or len(data) < 200: return False
+    if data is None or len(data) < 200:
+        return False
     close = data["close"]
     try:
         ma50 = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last = close.iloc[-1]
-        if not (last > ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1]): return False
-        if len(ma200) >= 25 and ma200.iloc[-1] <= ma200.iloc[-25]: return False
+        if not (last > ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1]):
+            return False
+        if len(ma200) >= 25 and ma200.iloc[-1] <= ma200.iloc[-25]:
+            return False
         if "max" in data.columns and len(data) >= 250:
-            if last < data["max"].rolling(250).max().iloc[-1] * 0.75: return False
+            if last < data["max"].rolling(250).max().iloc[-1] * 0.75:
+                return False
         return True
-    except: return False
+    except:
+        return False
 
 def vcp_math_check(data):
-    if data is None or len(data) < 60: return False
+    if data is None or len(data) < 60:
+        return False
     try:
         close = data["close"]
         volume = data["volume"]
@@ -87,7 +84,8 @@ def vcp_math_check(data):
         low = data["min"]
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
-        if pd.isna(vol_ma_20.iloc[-1]): return False
+        if pd.isna(vol_ma_20.iloc[-1]):
+            return False
         contractions = 0
         trough_prices = []
         in_pullback = False
@@ -95,20 +93,25 @@ def vcp_math_check(data):
             try:
                 pc = (close.iloc[i] - close.iloc[i-5]) / close.iloc[i-5] * 100
                 vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
-            except: continue
-            if not in_pullback and pc < -2 and vc < -15: in_pullback = True
+            except:
+                continue
+            if not in_pullback and pc < -2 and vc < -15:
+                in_pullback = True
             if in_pullback and pc > 0:
                 if len(trough_prices) == 0 or close.iloc[i] > trough_prices[-1]:
-                    trough_prices.append(close.iloc[i]); contractions += 1
+                    trough_prices.append(close.iloc[i])
+                    contractions += 1
                 in_pullback = False
-        if contractions < 2: return False
+        if contractions < 2:
+            return False
         rs_lookback = min(60, len(close))
         rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
         return {
             "symbol": "",
             "price": round(float(close.iloc[-1]), 2),
             "change_pct": round(float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100), 2),
-            "rs_score": rs, "contractions": contractions,
+            "rs_score": rs,
+            "contractions": contractions,
             "volume_ratio": round(float(recent_vol / vol_ma_20.iloc[-1]), 2),
             "quality": "A" if contractions >= 3 else "B" if contractions >= 2 else "C",
             "ma50": round(float(close.rolling(50).mean().iloc[-1]), 2) if len(close) >= 50 else None,
@@ -117,7 +120,8 @@ def vcp_math_check(data):
             "high_52w": round(float(high.rolling(250).max().iloc[-1]), 2) if len(high) >= 250 else round(float(high.max()), 2),
             "low_52w": round(float(low.rolling(250).min().iloc[-1]), 2) if len(low) >= 250 else round(float(low.min()), 2),
         }
-    except: return False
+    except:
+        return False
 
 def full_scan():
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
@@ -132,8 +136,10 @@ def full_scan():
                 sid = futures[future]
                 try:
                     df = future.result(timeout=15)
-                    if minervini_check(df): layer1_results.append((sid, df))
-                except: pass
+                    if minervini_check(df):
+                        layer1_results.append((sid, df))
+                except:
+                    pass
         time.sleep(0.3)
     layer2_results = []
     for sid, df in layer1_results:
@@ -150,7 +156,3 @@ def scan():
         return full_scan()
     except Exception as e:
         return {"error": str(e), "total": 0, "layer1": 0, "layer2": 0, "candidates": []}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
