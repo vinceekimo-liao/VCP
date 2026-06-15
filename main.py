@@ -1,17 +1,20 @@
 import os
 import sys
+import subprocess
+
+# ============================================================
+# 在執行時強制安裝 FinMind
+# ============================================================
+try:
+    import finmind
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "FinMind", "--no-cache-dir"])
+    import finmind
+
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import glob
-print("=== 搜尋 finmind ===")
-for path in glob.glob("/opt/render/project/src/.venv/lib/python*/site-packages/finmind"):
-    print(f"找到: {path}")
-# 強制設定 site-packages 路徑
-sys.path.insert(0, "/opt/render/project/src/.venv/lib/python3.11/site-packages")
-
-import finmind
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, Query
