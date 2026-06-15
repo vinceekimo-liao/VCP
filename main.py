@@ -3,12 +3,18 @@ import sys
 import subprocess
 
 # ============================================================
-# 在執行時強制安裝 FinMind
+# 確保 FinMind 可被載入
 # ============================================================
 try:
     import finmind
 except ImportError:
+    # 安裝 FinMind 到當前環境
     subprocess.check_call([sys.executable, "-m", "pip", "install", "FinMind", "--no-cache-dir"])
+    # 重新載入 site-packages
+    import site
+    from importlib import reload
+    reload(site)
+    # 再次嘗試 import
     import finmind
 
 import time
