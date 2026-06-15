@@ -4,6 +4,9 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# 強制設定 site-packages 路徑
+sys.path.insert(0, "/opt/render/project/src/.venv/lib/python3.11/site-packages")
+
 import finmind
 import pandas as pd
 import numpy as np
@@ -20,7 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-cache = {"data": None, "timestamp": None}
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
 def get_all_stocks():
@@ -82,6 +84,7 @@ def vcp_math_check(data):
         rs_lookback = min(60, len(close))
         rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
         return {
+            "symbol": "",
             "price": round(float(close.iloc[-1]), 2),
             "change_pct": round(float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100), 2),
             "rs_score": rs, "contractions": contractions,
