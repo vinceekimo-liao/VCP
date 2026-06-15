@@ -36,6 +36,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"message": "Hello Render + FinMind"}
+
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
 def get_all_stocks():
