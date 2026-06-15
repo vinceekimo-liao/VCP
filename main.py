@@ -1,73 +1,14 @@
-# ============================================================
-# 強制使用 .venv 中的 Python 和套件
-# ============================================================
-import sys
 import os
-import subprocess
-
-# 取得 .venv 路徑
-venv_path = "/opt/render/project/src/.venv"
-venv_python = os.path.join(venv_path, "bin", "python")
-venv_site_packages = os.path.join(venv_path, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
-
-# 將 .venv 的 site-packages 加入 sys.path
-if venv_site_packages not in sys.path:
-    sys.path.insert(0, venv_site_packages)
-
-# 使用 .venv 的 pip 安裝
-def ensure_package(pip_name):
-    subprocess.check_call([venv_python, "-m", "pip", "install", pip_name],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-# 安裝 FinMind（如果還沒裝）
-try:
-    import finmind
-except ImportError:
-    ensure_package("FinMind==1.6.6")
-    import finmind
-# ============================================================
-
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
 import time
-
-# ... 其餘程式碼保持不變 ...
-# ============================================================
-# 強制安裝依賴（解決 Render 虛擬環境路徑問題）
-# ============================================================
-import subprocess
-import sys
-import os
-
-def ensure_package(package_name, pip_name=None):
-    """確保套件已安裝，若無則自動安裝"""
-    if pip_name is None:
-        pip_name = package_name
-    try:
-        __import__(package_name)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
-
-# 依序檢查並安裝所有依賴
-ensure_package("finmind", "FinMind==1.6.6")
-ensure_package("pandas", "pandas>=2.0.0")
-ensure_package("numpy", "numpy>=1.24.0")
-ensure_package("fastapi", "fastapi==0.104.1")
-ensure_package("uvicorn", "uvicorn==0.24.0")
-# ============================================================
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import finmind
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 
 app = FastAPI()
 
@@ -124,7 +65,6 @@ def vcp_math_check(data):
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
         if pd.isna(vol_ma_20.iloc[-1]): return False
-        if recent_vol > vol_ma_20.iloc[-1] * 0.8: return False
         contractions = 0
         trough_prices = []
         in_pullback = False
@@ -141,12 +81,12 @@ def vcp_math_check(data):
         if contractions < 2: return False
         rs_lookback = min(60, len(close))
         rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
-        if rs < 60: return False
         return {
             "price": round(float(close.iloc[-1]), 2),
             "change_pct": round(float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100), 2),
             "rs_score": rs, "contractions": contractions,
             "volume_ratio": round(float(recent_vol / vol_ma_20.iloc[-1]), 2),
+            "quality": "A" if contractions >= 3 else "B" if contractions >= 2 else "C",
             "ma50": round(float(close.rolling(50).mean().iloc[-1]), 2) if len(close) >= 50 else None,
             "ma150": round(float(close.rolling(150).mean().iloc[-1]), 2) if len(close) >= 150 else None,
             "ma200": round(float(close.rolling(200).mean().iloc[-1]), 2) if len(close) >= 200 else None,
@@ -156,16 +96,12 @@ def vcp_math_check(data):
     except: return False
 
 def full_scan():
-    print("開始全市場掃描...")
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     stocks = get_all_stocks()
     total = len(stocks)
-    print(f"總股票數: {total}")
     layer1_results = []
-    batch_size = 100
-    for i in range(0, total, batch_size):
-        batch = stocks[i:i+batch_size]
-        print(f"批次 {i//batch_size + 1}/{(total-1)//batch_size + 1}")
+    for i in range(0, total, 100):
+        batch = stocks[i:i+100]
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(fetch_daily, sid, start_date): sid for sid in batch}
             for future in as_completed(futures):
@@ -174,39 +110,23 @@ def full_scan():
                     df = future.result(timeout=15)
                     if minervini_check(df): layer1_results.append((sid, df))
                 except: pass
-        time.sleep(0.5)
-    layer1_count = len(layer1_results)
-    print(f"第一層通過: {layer1_count}")
+        time.sleep(0.3)
     layer2_results = []
     for sid, df in layer1_results:
         result = vcp_math_check(df)
         if result:
             result["symbol"] = sid
-            if result["contractions"] >= 3 and result["volume_ratio"] >= 1.5: result["quality"] = "A"
-            elif result["contractions"] >= 2: result["quality"] = "B"
-            else: result["quality"] = "C"
             layer2_results.append(result)
-    layer2_count = len(layer2_results)
-    print(f"第二層通過: {layer2_count}")
-    layer2_results.sort(key=lambda x: (x["quality"] != "A", x["quality"] != "B", -x["rs_score"]))
-    return {"total": total, "layer1": layer1_count, "layer2": layer2_count, "candidates": layer2_results[:10], "timestamp": datetime.now().isoformat()}
+    layer2_results.sort(key=lambda x: (-x["rs_score"]))
+    return {"total": total, "layer1": len(layer1_results), "layer2": len(layer2_results), "candidates": layer2_results[:10]}
 
 @app.get("/scan")
-def scan(force: bool = Query(False)):
-    global cache
-    if not force and cache["data"] and cache["timestamp"]:
-        if (datetime.now() - cache["timestamp"]).seconds < 1800: return cache["data"]
+def scan():
     try:
-        result = full_scan()
-        cache["data"] = result; cache["timestamp"] = datetime.now()
-        return result
+        return full_scan()
     except Exception as e:
         return {"error": str(e), "total": 0, "layer1": 0, "layer2": 0, "candidates": []}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now().isoformat()}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"status": "ok"}
