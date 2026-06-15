@@ -1,4 +1,42 @@
 # ============================================================
+# 強制使用 .venv 中的 Python 和套件
+# ============================================================
+import sys
+import os
+import subprocess
+
+# 取得 .venv 路徑
+venv_path = "/opt/render/project/src/.venv"
+venv_python = os.path.join(venv_path, "bin", "python")
+venv_site_packages = os.path.join(venv_path, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
+
+# 將 .venv 的 site-packages 加入 sys.path
+if venv_site_packages not in sys.path:
+    sys.path.insert(0, venv_site_packages)
+
+# 使用 .venv 的 pip 安裝
+def ensure_package(pip_name):
+    subprocess.check_call([venv_python, "-m", "pip", "install", pip_name],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# 安裝 FinMind（如果還沒裝）
+try:
+    import finmind
+except ImportError:
+    ensure_package("FinMind==1.6.6")
+    import finmind
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+# ... 其餘程式碼保持不變 ...
+# ============================================================
 # 強制安裝依賴（解決 Render 虛擬環境路徑問題）
 # ============================================================
 import subprocess
