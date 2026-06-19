@@ -21,30 +21,6 @@ app.add_middleware(
 
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
-# ========== 輔助：欄位名稱對照 ==========
-def normalize_columns(df):
-    """將可能的欄位名稱（大小寫、簡稱）統一為小寫標準名稱"""
-    mapping = {
-        'close': 'close', 'Close': 'close', 'CLOSE': 'close',
-        'volume': 'volume', 'Volume': 'volume', 'VOLUME': 'volume',
-        'max': 'high', 'high': 'high', 'High': 'high', 'HIGH': 'high',
-        'min': 'low', 'low': 'low', 'Low': 'low', 'LOW': 'low',
-        'open': 'open', 'Open': 'open', 'OPEN': 'open',
-        'date': 'date', 'Date': 'date', 'DATE': 'date',
-    }
-    rename_dict = {}
-    for col in df.columns:
-        if col in mapping:
-            rename_dict[col] = mapping[col]
-    if rename_dict:
-        df = df.rename(columns=rename_dict)
-    # 若仍然缺少必要欄位，嘗試從原始 dataframe 建立
-    if 'high' not in df.columns and 'max' in df.columns:
-        df['high'] = df['max']
-    if 'low' not in df.columns and 'min' in df.columns:
-        df['low'] = df['min']
-    return df
-
 # ========== 資料取得 ==========
 def get_all_stocks():
     api = DataLoader()
@@ -69,22 +45,26 @@ def fetch_daily(sid, start_date):
         data["date"] = pd.to_datetime(data["date"])
         data.sort_values("date", inplace=True)
         data.set_index("date", inplace=True)
-        # 標準化欄位名稱
-        data = normalize_columns(data)
         return data
     except Exception as e:
-        print(f"  fetch_daily error for {sid}: {e}")
         return None
 
-# ========== 第一層：Minervini 趨勢模板 ==========
+# ========== 第一層：Minervini 趨勢模板（放寬） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
+
+    # 使用大寫欄位（DataLoader 預設格式）
     try:
-        close = data["close"]
-        high = data["high"] if "high" in data.columns else None
+        close = data["Close"]
+        high = data["High"]
     except KeyError:
-        return False
+        # 若為小寫，改用小寫
+        try:
+            close = data["close"]
+            high = data["high"]
+        except KeyError:
+            return False
 
     try:
         ma50 = close.rolling(50).mean()
@@ -92,7 +72,9 @@ def minervini_check(data):
         ma200 = close.rolling(200).mean()
 
         last = close.iloc[-1]
-        if not (last > ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1]):
+
+        # 放寬：只需收盤 > MA150 和 MA200（不強制 MA50 > MA150）
+        if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
 
         # MA200 近 25 日向上
@@ -100,7 +82,7 @@ def minervini_check(data):
             return False
 
         # 距 52 週高點 ≤ 25%
-        if high is not None and len(high) >= 250:
+        if len(high) >= 250:
             high_52w = high.rolling(250).max().iloc[-1]
             if last < high_52w * 0.75:
                 return False
@@ -109,40 +91,44 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP 數學波動收縮（放寬版） ==========
+# ========== 第二層：VCP 數學波動收縮（終極放寬） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return False
-    try:
-        close = data["close"]
-        volume = data["volume"]
-        high = data["high"]
-        low = data["low"]
-    except KeyError:
-        return False
 
+    # 使用大寫欄位
     try:
-        vol_ma_20 = volume.rolling(20).mean()
-        recent_vol = volume.iloc[-3:].mean()
-        if pd.isna(vol_ma_20.iloc[-1]):
+        close = data["Close"]
+        volume = data["Volume"]
+        high = data["High"]
+        low = data["Low"]
+    except KeyError:
+        try:
+            close = data["close"]
+            volume = data["volume"]
+            high = data["high"]
+            low = data["low"]
+        except KeyError:
             return False
 
-        # ===== 暫時移除窒息量條件 =====
-        # if recent_vol > vol_ma_20.iloc[-1] * 0.8:
-        #     return False
-        # 記錄但不過濾
-        dry_up = recent_vol < vol_ma_20.iloc[-1] * 0.8
-        # =============================
+    try:
+        # 計算波動率（直接用 20 日標準差）
+        rolling_std = close.rolling(20).std()
+        latest_std = rolling_std.iloc[-1]
+        std_min_60 = rolling_std.rolling(60).min().iloc[-1]
 
+        # 計算收縮次數
         contractions = 0
         trough_prices = []
         in_pullback = False
+
         for i in range(20, len(close) - 5):
             try:
                 pc = (close.iloc[i] - close.iloc[i-5]) / close.iloc[i-5] * 100
                 vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
             except:
                 continue
+
             if not in_pullback and pc < -2 and vc < -15:
                 in_pullback = True
             if in_pullback and pc > 0:
@@ -151,34 +137,27 @@ def vcp_math_check(data):
                     contractions += 1
                 in_pullback = False
 
-        # ===== 放寬收縮次數門檻為 ≥1 =====
-        if contractions < 1:
+        # 放寬：若波動率處於 60 天低點，即使收縮次數為 0 也給過
+        is_low_vol = latest_std <= std_min_60 * 1.05
+        if contractions == 0 and not is_low_vol:
             return False
-        # ================================
 
         # RS 強度
         rs_lookback = min(60, len(close))
         rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
 
-        # 品質評級（加入窒息量作為加分項，但不強制）
+        # 品質評級
         quality_score = 0
-        if contractions >= 3:
-            quality_score += 2
-        elif contractions >= 2:
-            quality_score += 1
-        if dry_up:
-            quality_score += 2
-        if rs >= 70:
-            quality_score += 1
-        if rs >= 85:
-            quality_score += 1
+        if contractions >= 3: quality_score += 2
+        elif contractions >= 2: quality_score += 1
+        if is_low_vol: quality_score += 2
+        if rs >= 70: quality_score += 1
+        if rs >= 85: quality_score += 1
 
-        if quality_score >= 4:
-            quality = "A"
-        elif quality_score >= 2:
-            quality = "B"
-        else:
-            quality = "C"
+        quality = "A" if quality_score >= 4 else "B" if quality_score >= 2 else "C"
+
+        vol_ma_20 = volume.rolling(20).mean()
+        recent_vol = volume.iloc[-3:].mean()
 
         return {
             "symbol": "",
@@ -186,7 +165,7 @@ def vcp_math_check(data):
             "change_pct": round(float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100), 2),
             "rs_score": rs,
             "contractions": contractions,
-            "volume_ratio": round(float(recent_vol / vol_ma_20.iloc[-1]), 2),
+            "volume_ratio": round(float(recent_vol / vol_ma_20.iloc[-1]), 2) if not pd.isna(vol_ma_20.iloc[-1]) else 0,
             "quality": quality,
             "ma50": round(float(close.rolling(50).mean().iloc[-1]), 2) if len(close) >= 50 else None,
             "ma150": round(float(close.rolling(150).mean().iloc[-1]), 2) if len(close) >= 150 else None,
@@ -205,11 +184,9 @@ def full_scan():
     total = len(stocks)
     print(f"開始掃描，總股票數：{total}")
 
-    # 第一層
     layer1_results = []
-    batch_size = 100
-    for i in range(0, total, batch_size):
-        batch = stocks[i:i+batch_size]
+    for i in range(0, total, 100):
+        batch = stocks[i:i+100]
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(fetch_daily, sid, start_date): sid for sid in batch}
             for future in as_completed(futures):
@@ -225,7 +202,6 @@ def full_scan():
     layer1_count = len(layer1_results)
     print(f"第一層通過：{layer1_count} 檔")
 
-    # 第二層
     layer2_results = []
     for sid, df in layer1_results:
         result = vcp_math_check(df)
@@ -236,7 +212,6 @@ def full_scan():
     layer2_count = len(layer2_results)
     print(f"第二層通過：{layer2_count} 檔")
 
-    # 依 RS 排序
     layer2_results.sort(key=lambda x: (-x["rs_score"]))
     return {"total": total, "layer1": layer1_count, "layer2": layer2_count, "candidates": layer2_results[:10]}
 
