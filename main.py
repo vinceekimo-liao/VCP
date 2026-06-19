@@ -64,14 +64,11 @@ def get_all_stocks():
     print(f"✅ 篩選後股票數量：{len(stock_ids)}")
     return stock_ids
 
-
 def fetch_daily(sid, start_date):
-    """使用 FinMind 正確的 API 方法：taiwan_stock_daily"""
     api = DataLoader()
     if FINMIND_TOKEN:
         api.login_by_token(FINMIND_TOKEN)
     try:
-        # ✅ 修正方法名稱：taiwan_stock_daily
         data = api.taiwan_stock_daily(
             stock_id=sid,
             start_date=start_date,
@@ -87,12 +84,10 @@ def fetch_daily(sid, start_date):
         print(f"  fetch_daily error for {sid}: {e}")
         return None
 
-
-# ========== 第一層：Minervini 趨勢模板 ==========
+# ========== 第一層：Minervini ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
-
     if "close" in data.columns and "max" in data.columns:
         close = data["close"]
         high = data["max"]
@@ -101,34 +96,27 @@ def minervini_check(data):
         high = data["High"]
     else:
         return False
-
     try:
         ma50 = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last = close.iloc[-1]
-
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-
         if len(ma200) >= 25 and ma200.iloc[-1] <= ma200.iloc[-25]:
             return False
-
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
             if pd.notna(high_52w) and last < high_52w * 0.75:
                 return False
-
         return True
     except:
         return False
 
-
-# ========== 第二層：VCP 數學波動收縮 ==========
+# ========== 第二層：VCP ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return False
-
     if "close" in data.columns and "Trading_Volume" in data.columns and "max" in data.columns:
         close = data["close"]
         volume = data["Trading_Volume"]
@@ -141,19 +129,16 @@ def vcp_math_check(data):
         low = data["Low"]
     else:
         return False
-
     try:
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
         if pd.isna(vol_ma_20.iloc[-1]):
             return False
-
         rolling_std = close.rolling(20).std()
         latest_std = rolling_std.iloc[-1]
         if pd.isna(latest_std):
             return False
         std_min_60 = rolling_std.rolling(60, min_periods=20).min().iloc[-1]
-
         contractions = 0
         trough_prices = []
         in_pullback = False
@@ -170,14 +155,11 @@ def vcp_math_check(data):
                     trough_prices.append(close.iloc[i])
                     contractions += 1
                 in_pullback = False
-
         is_low_vol = (latest_std <= std_min_60 * 1.05) if pd.notna(std_min_60) else False
         if contractions == 0 and not is_low_vol:
             return False
-
         rs_lookback = min(60, len(close))
         rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
-
         quality_score = 0
         if contractions >= 3: quality_score += 2
         elif contractions >= 2: quality_score += 1
@@ -185,7 +167,6 @@ def vcp_math_check(data):
         if rs >= 70: quality_score += 1
         if rs >= 85: quality_score += 1
         quality = "A" if quality_score >= 4 else "B" if quality_score >= 2 else "C"
-
         return {
             "symbol": "",
             "price": round(float(close.iloc[-1]), 2),
@@ -204,8 +185,7 @@ def vcp_math_check(data):
         print(f"  vcp_math_check error: {e}")
         return False
 
-
-# ========== 主掃描函數 ==========
+# ========== 主掃描 ==========
 def full_scan():
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     stocks = get_all_stocks()
@@ -213,7 +193,6 @@ def full_scan():
     print(f"📊 總股票數: {total}")
     if total == 0:
         return {"total": 0, "layer1": 0, "layer2": 0, "candidates": [], "error": "No stocks (check token or network)"}
-
     layer1_results = []
     for i in range(0, total, 100):
         batch = stocks[i:i+100]
@@ -229,24 +208,19 @@ def full_scan():
                 except:
                     pass
         time.sleep(0.3)
-
     layer1_count = len(layer1_results)
     print(f"✅ 第一層通過: {layer1_count} 檔")
-
     layer2_results = []
     for sid, df in layer1_results:
         result = vcp_math_check(df)
         if result:
             result["symbol"] = sid
             layer2_results.append(result)
-
     layer2_count = len(layer2_results)
     print(f"✅ 第二層通過: {layer2_count} 檔")
     layer2_results.sort(key=lambda x: (-x["rs_score"]))
     return {"total": total, "layer1": layer1_count, "layer2": layer2_count, "candidates": layer2_results[:10]}
 
-
-# ========== API 端點 ==========
 @app.get("/scan")
 def scan():
     try:
@@ -254,11 +228,9 @@ def scan():
     except Exception as e:
         return {"error": str(e), "total": 0, "layer1": 0, "layer2": 0, "candidates": []}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.get("/test-token")
 def test_token():
