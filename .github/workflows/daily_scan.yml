@@ -1,32 +1,31 @@
-name: Daily VCP Scan
+name: Nightly VCP Scan
 
 on:
   schedule:
-    - cron: '0 8 * * 1-5'   # UTC 08:00 = 台灣時間 16:00 (週一～週五)
-  workflow_dispatch:          # 允許手動觸發
+    # 台灣時間 23:00 (UTC 15:00) 開始掃描
+    - cron: '0 15 * * *'
+  workflow_dispatch:   # 允許手動觸發測試
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360   # 6 小時，足夠掃完 1500 檔
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4.2.0   # 改用完整版號，支援 Node 24
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5.4.0
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run scan and notify
+      - name: Run nightly scan
         env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-        run: |
-          python scan_and_notify.py
+        run: python scan_and_notify.py
