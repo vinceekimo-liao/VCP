@@ -33,7 +33,6 @@ def get_all_market_data(days_lookback=400):
     start_date = (datetime.today() - timedelta(days=days_lookback)).strftime("%Y-%m-%d")
 
     print(f"⏳ 一次性下載全市場資料：{start_date} ～ {end_date}")
-    # 關鍵：不指定 stock_id，即回傳全市場資料
     df = api.taiwan_stock_daily(start_date=start_date, end_date=end_date)
     if df is None or df.empty:
         print("❌ 下載的資料為空")
@@ -41,9 +40,8 @@ def get_all_market_data(days_lookback=400):
     print(f"✅ 下載完成，總資料筆數：{len(df)}")
     return df
 
-# ========== 取得股票清單（只為了過濾普通股，不拿來逐檔下載） ==========
+# ========== 取得股票清單 ==========
 def get_filtered_stock_ids():
-    """回傳一組普通股代號（排除權證、ETF等），用於後續過濾全市場資料。"""
     api = DataLoader()
     if FINMIND_TOKEN:
         api.login_by_token(FINMIND_TOKEN)
@@ -51,9 +49,7 @@ def get_filtered_stock_ids():
     if info is None or info.empty:
         return []
 
-    # 排除名稱含有「權、ETF、存託憑證」的標的
     info = info[~info["stock_name"].str.contains("權|ETF|存託憑證", na=False)]
-    # 只留代號長度為 4 碼
     info = info[info["stock_id"].str.len() == 4]
     stock_ids = info["stock_id"].unique().tolist()
     print(f"📋 普通股代號數量：{len(stock_ids)}")
@@ -61,34 +57,23 @@ def get_filtered_stock_ids():
 
 # ========== 批次篩選：向量化處理 ==========
 def batch_process_filter(df, valid_stock_ids):
-    """
-    在全市場資料中，僅保留 valid_stock_ids，然後進行 Minervini 第一層篩選。
-    回傳符合條件的股票代號與其最新一筆資料。
-    """
     if df.empty:
         return pd.DataFrame()
 
-    # 只保留我們要的股票代號
     df = df[df["stock_id"].isin(valid_stock_ids)].copy()
 
-    # 欄位統一（FinMind 回傳欄位已確認為小寫）
     required_cols = {"stock_id", "date", "close", "high", "low", "volume"}
     if not required_cols.issubset(df.columns):
         missing = required_cols - set(df.columns)
         print(f"❌ 缺少必要欄位：{missing}")
         return pd.DataFrame()
 
-    # 轉換日期
     df["date"] = pd.to_datetime(df["date"])
-
-    # 強制轉數值，避免字串比較
     for col in ["close", "high", "low", "volume"]:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # 按股票代號與日期排序
     df = df.sort_values(["stock_id", "date"])
 
-    # ---- 向量化計算技術指標 ----
     print("🧮 向量化計算均線與 52 週高點...")
     grouped = df.groupby("stock_id")
 
@@ -97,16 +82,13 @@ def batch_process_filter(df, valid_stock_ids):
     df["ma200"] = grouped["close"].transform(lambda x: x.rolling(200, min_periods=1).mean())
     df["high_52w"] = grouped["high"].transform(lambda x: x.rolling(250, min_periods=1).max())
 
-    # 取得每檔股票「最新一天」的資料
-    latest = df.groupby("stock_id").tail(1).copy()
+    # 🔧 微調：reset_index 確保索引乾淨
+    latest = df.groupby("stock_id").tail(1).copy().reset_index(drop=True)
 
-    # ---- Minervini 條件 ----
     cond = (
         (latest["close"] > latest["ma150"]) &
         (latest["close"] > latest["ma200"]) &
-        # MA200 近 25 日趨勢放寬：只淘汰下跌超過 2% 的狀況
         (latest["ma200"] >= latest.groupby("stock_id")["ma200"].shift(25) * 0.98) &
-        # 距 52 週高點 ≤ 25%
         (latest["close"] >= latest["high_52w"] * 0.75)
     )
 
@@ -114,9 +96,8 @@ def batch_process_filter(df, valid_stock_ids):
     print(f"🎯 第一層篩選後剩餘：{len(candidates)} 檔")
     return candidates
 
-# ========== VCP 第二層篩選（仍可針對個別股票處理，因為候選已很少） ==========
+# ========== VCP 第二層篩選 ==========
 def vcp_math_check(stock_df):
-    """對單一股票 DataFrame 進行 VCP 收縮判斷（向量化較複雜，保留逐檔）。"""
     if stock_df is None or len(stock_df) < 60:
         return None
 
@@ -184,24 +165,19 @@ def vcp_math_check(stock_df):
 
 # ========== 主掃描流程 ==========
 def full_scan():
-    # 步驟 1：取得普通股代號清單（僅用於過濾，不拿來逐檔下載）
     valid_ids = get_filtered_stock_ids()
     if not valid_ids:
         return {"total": 0, "layer1": 0, "layer2": 0, "candidates": []}
 
-    # 步驟 2：一次性下載全市場資料（只花 1 次 API）
     df_all = get_all_market_data(days_lookback=400)
     if df_all.empty:
         return {"total": 0, "layer1": 0, "layer2": 0, "candidates": []}
 
-    # 步驟 3：批次處理第一層（Minervini）
     layer1_df = batch_process_filter(df_all, valid_ids)
     layer1_count = len(layer1_df)
     if layer1_df.empty:
         return {"total": len(valid_ids), "layer1": 0, "layer2": 0, "candidates": []}
 
-    # 步驟 4：針對第一層通過的股票，進行第二層 VCP 篩選
-    # 先從原始 df 中取出這些股票的完整歷史
     selected_ids = layer1_df["stock_id"].tolist()
     hist_data = df_all[df_all["stock_id"].isin(selected_ids)]
 
@@ -223,7 +199,6 @@ def full_scan():
         "candidates": layer2_results[:10]
     }
 
-# ========== API 端點 ==========
 @app.get("/scan")
 def scan():
     try:
@@ -237,7 +212,6 @@ def health():
 
 @app.get("/test/{sid}")
 def test_stock(sid: str):
-    """單股測試，檢查欄位與資料筆數"""
     api = DataLoader()
     if FINMIND_TOKEN:
         api.login_by_token(FINMIND_TOKEN)
