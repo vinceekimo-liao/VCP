@@ -18,9 +18,7 @@ app.add_middleware(
 
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
-# ══════════════════════════════════════════════════
-# 工具：取得普通股代號
-# ══════════════════════════════════════════════════
+# ========== 取得普通股清單 ==========
 def get_all_stocks():
     api = DataLoader()
     if FINMIND_TOKEN:
@@ -51,9 +49,7 @@ def get_all_stocks():
 
     return common[id_col].tolist()
 
-# ══════════════════════════════════════════════════
-# 批量下載全市場歷史資料（一次一天）
-# ══════════════════════════════════════════════════
+# ========== 批量下載歷史資料（逐日全市場） ==========
 def build_stock_data(stock_ids, start_date, end_date):
     api = DataLoader()
     if FINMIND_TOKEN:
@@ -64,12 +60,13 @@ def build_stock_data(stock_ids, start_date, end_date):
     for d in date_range:
         ds = d.strftime("%Y-%m-%d")
         try:
-            daily = api.taiwan_stock_price_list(date=ds)
+            # ✅ 關鍵修正：改用 taiwan_stock_daily
+            daily = api.taiwan_stock_daily(date=ds)
             if daily is not None and not daily.empty:
                 frames.append(daily)
         except Exception as e:
             print(f"  ⚠️ 下載 {ds} 失敗：{e}")
-        time.sleep(0.05)
+        time.sleep(0.05)   # 禮貌性延遲，避免過快請求
 
     if not frames:
         print("❌ 完全沒有下載到任何資料")
@@ -77,7 +74,7 @@ def build_stock_data(stock_ids, start_date, end_date):
 
     df_all = pd.concat(frames, ignore_index=True)
 
-    # ★ 除錯：印出欄位名稱與第一筆資料
+    # ★ 除錯：印出欄位名稱與前兩筆
     print("📋 下載欄位名稱：", df_all.columns.tolist())
     print("📋 前兩筆資料：\n", df_all.head(2).to_string())
 
@@ -92,9 +89,7 @@ def build_stock_data(stock_ids, start_date, end_date):
         stock_data[sid] = grp
     return stock_data
 
-# ══════════════════════════════════════════════════
-# 第一層：Minervini 趨勢模板（已增強欄位相容）
-# ══════════════════════════════════════════════════
+# ========== 第一層：Minervini 趨勢模板（強化版） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -110,19 +105,29 @@ def minervini_check(data):
     if close is None or high is None:
         return False
 
+    # 強制轉為數值，避免字串比對
+    close = pd.to_numeric(close, errors='coerce')
+    high  = pd.to_numeric(high, errors='coerce')
+
     try:
-        ma50 = close.rolling(50).mean()
+        ma50  = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
-        last = close.iloc[-1]
+        last  = close.iloc[-1]
 
-        # 條件放寬：只需收盤 > MA150 且 > MA200
+        # 檢查 NaN（資料不足 200 筆時，ma200 可能為 NaN）
+        if pd.isna(ma200.iloc[-1]) or pd.isna(ma150.iloc[-1]):
+            return False
+
+        # 放寬條件：收盤 > MA150 且 > MA200
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
 
-        # MA200 近 25 日必須向上
-        if len(ma200) >= 25 and ma200.iloc[-1] <= ma200.iloc[-25]:
-            return False
+        # MA200 近 25 日向上
+        if len(ma200) >= 25:
+            ma200_start = ma200.iloc[-25]
+            if pd.notna(ma200_start) and ma200.iloc[-1] <= ma200_start:
+                return False
 
         # 距 52 週高點 ≤ 25%
         if len(high) >= 200:
@@ -131,17 +136,16 @@ def minervini_check(data):
                 return False
 
         return True
-    except:
+    except Exception as e:
+        print(f"  minervini_check error: {e}")
         return False
 
-# ══════════════════════════════════════════════════
-# 第二層：VCP 波動收縮（已增強欄位相容）
-# ══════════════════════════════════════════════════
+# ========== 第二層：VCP 波動收縮 ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return False
 
-    # 動態抓取 close, volume, high, low
+    # 動態抓取欄位
     close = None; volume = None; high = None; low = None
     for col in data.columns:
         c = col.lower()
@@ -152,18 +156,24 @@ def vcp_math_check(data):
     if close is None or volume is None or high is None or low is None:
         return False
 
+    # 強制數值化
+    close  = pd.to_numeric(close, errors='coerce')
+    volume = pd.to_numeric(volume, errors='coerce')
+    high   = pd.to_numeric(high, errors='coerce')
+    low    = pd.to_numeric(low, errors='coerce')
+
     try:
-        vol_ma_20 = volume.rolling(20).mean()
+        vol_ma_20  = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
         if pd.isna(vol_ma_20.iloc[-1]): return False
 
         rolling_std = close.rolling(20).std()
-        latest_std = rolling_std.iloc[-1]
+        latest_std  = rolling_std.iloc[-1]
         if pd.isna(latest_std): return False
         std_min_60 = rolling_std.rolling(60, min_periods=20).min().iloc[-1]
 
         contractions = 0
-        in_pullback = False
+        in_pullback  = False
         for i in range(20, len(close)-5):
             try:
                 pc = (close.iloc[i]-close.iloc[i-5])/close.iloc[i-5]*100
@@ -174,7 +184,7 @@ def vcp_math_check(data):
                 contractions += 1
                 in_pullback = False
 
-        is_low_vol = latest_std <= std_min_60*1.05 if pd.notna(std_min_60) else False
+        is_low_vol = (latest_std <= std_min_60*1.05) if pd.notna(std_min_60) else False
         if contractions==0 and not is_low_vol: return False
 
         rs = min(99, max(1, int(50+(close.iloc[-1]-close.iloc[-60])/close.iloc[-60]*200)))
@@ -197,9 +207,7 @@ def vcp_math_check(data):
         print(f"vcp error: {e}")
         return False
 
-# ══════════════════════════════════════════════════
-# 主掃描
-# ══════════════════════════════════════════════════
+# ========== 主掃描 ==========
 def full_scan():
     start = datetime.today() - timedelta(days=400)
     end   = datetime.today()
