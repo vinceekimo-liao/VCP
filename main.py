@@ -209,3 +209,21 @@ def test_token():
         "token_preview": token_preview,
         "env_keys": list(os.environ.keys())  # 列出所有環境變數名稱
     }
+
+@app.get("/test-stocks")
+def test_stocks():
+    try:
+        api = DataLoader()
+        if FINMIND_TOKEN:
+            api.login_by_token(FINMIND_TOKEN)
+        info = api.taiwan_stock_info()
+        if info is None or info.empty:
+            return {"error": "api.taiwan_stock_info() returned empty or None"}
+        common_stocks = info[(info["type"] == "Common Stock") & (info["stock_id"].str.len() == 4)]
+        return {
+            "total_raw": len(info),
+            "common_stocks": len(common_stocks),
+            "sample": common_stocks["stock_id"].head(10).tolist()
+        }
+    except Exception as e:
+        return {"error": str(e)}
