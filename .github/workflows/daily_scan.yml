@@ -2,7 +2,7 @@ name: Daily VCP Scan
 
 on:
   schedule:
-    - cron: '0 8 * * 1-5'   # 台灣時間週一到週五下午4點 (UTC 8:00)
+    - cron: '0 8 * * 1-5'   # UTC 08:00 = 台灣時間 16:00 (週一～週五)
   workflow_dispatch:          # 允許手動觸發
 
 jobs:
@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.0   # 改用完整版號，支援 Node 24
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.11'
 
