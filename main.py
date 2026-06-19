@@ -199,3 +199,13 @@ def scan():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/test-token")
+def test_token():
+    token_exists = bool(FINMIND_TOKEN)
+    token_preview = FINMIND_TOKEN[:8] + "..." if len(FINMIND_TOKEN) > 8 else "(空)"
+    return {
+        "token_exists": token_exists,
+        "token_preview": token_preview,
+        "env_keys": list(os.environ.keys())  # 列出所有環境變數名稱
+    }
