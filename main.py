@@ -1,16 +1,16 @@
 import os
 import time
+import traceback
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from FinMind.data import DataLoader
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,20 +21,28 @@ app.add_middleware(
 
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
-# ========== 資料取得 ==========
+# ========== 資料取得（含診斷） ==========
 def get_all_stocks():
-    api = DataLoader()
-    if FINMIND_TOKEN:
-        api.login_by_token(FINMIND_TOKEN)
-    info = api.taiwan_stock_info()
-    info = info[(info["type"] == "Common Stock") & (info["stock_id"].str.len() == 4)]
-    return info["stock_id"].tolist()
+    try:
+        api = DataLoader()
+        if FINMIND_TOKEN:
+            api.login_by_token(FINMIND_TOKEN)
+        info = api.taiwan_stock_info()
+        if info.empty:
+            print("❌ 股票清單為空，請檢查 FINMIND_TOKEN 或網路")
+            return []
+        info = info[(info["type"] == "Common Stock") & (info["stock_id"].str.len() == 4)]
+        return info["stock_id"].tolist()
+    except Exception as e:
+        print(f"❌ get_all_stocks 錯誤: {e}")
+        traceback.print_exc()
+        return []
 
 def fetch_daily(sid, start_date):
-    api = DataLoader()
-    if FINMIND_TOKEN:
-        api.login_by_token(FINMIND_TOKEN)
     try:
+        api = DataLoader()
+        if FINMIND_TOKEN:
+            api.login_by_token(FINMIND_TOKEN)
         data = api.taiwan_stock_price(
             stock_id=sid,
             start_date=start_date,
@@ -47,88 +55,65 @@ def fetch_daily(sid, start_date):
         data.set_index("date", inplace=True)
         return data
     except Exception as e:
+        print(f"  fetch_daily error for {sid}: {e}")
         return None
 
-# ========== 第一層：Minervini 趨勢模板（放寬） ==========
+# ========== 第一層：Minervini（放寬版） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
-
-    # 使用大寫欄位（DataLoader 預設格式）
-    try:
-        close = data["Close"]
-        high = data["High"]
-    except KeyError:
-        # 若為小寫，改用小寫
-        try:
-            close = data["close"]
-            high = data["high"]
-        except KeyError:
-            return False
-
+    # 自動判斷大寫/小寫欄位
+    close = data["Close"] if "Close" in data.columns else data.get("close")
+    high = data["High"] if "High" in data.columns else data.get("high")
+    if close is None or high is None:
+        return False
     try:
         ma50 = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
-
         last = close.iloc[-1]
-
-        # 放寬：只需收盤 > MA150 和 MA200（不強制 MA50 > MA150）
+        # 放寬：只需收盤 > MA150 且 > MA200
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-
         # MA200 近 25 日向上
         if len(ma200) >= 25 and ma200.iloc[-1] <= ma200.iloc[-25]:
             return False
-
         # 距 52 週高點 ≤ 25%
         if len(high) >= 250:
             high_52w = high.rolling(250).max().iloc[-1]
             if last < high_52w * 0.75:
                 return False
-
         return True
     except:
         return False
 
-# ========== 第二層：VCP 數學波動收縮（終極放寬） ==========
+# ========== 第二層：VCP（終極放寬 + 波動率輔助） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return False
-
-    # 使用大寫欄位
+    close = data["Close"] if "Close" in data.columns else data.get("close")
+    volume = data["Volume"] if "Volume" in data.columns else data.get("volume")
+    high = data["High"] if "High" in data.columns else data.get("high")
+    low = data["Low"] if "Low" in data.columns else data.get("low")
+    if close is None or volume is None or high is None or low is None:
+        return False
     try:
-        close = data["Close"]
-        volume = data["Volume"]
-        high = data["High"]
-        low = data["Low"]
-    except KeyError:
-        try:
-            close = data["close"]
-            volume = data["volume"]
-            high = data["high"]
-            low = data["low"]
-        except KeyError:
-            return False
-
-    try:
-        # 計算波動率（直接用 20 日標準差）
+        vol_ma_20 = volume.rolling(20).mean()
+        recent_vol = volume.iloc[-3:].mean()
+        # 波動率（標準差）
         rolling_std = close.rolling(20).std()
         latest_std = rolling_std.iloc[-1]
         std_min_60 = rolling_std.rolling(60).min().iloc[-1]
-
-        # 計算收縮次數
+        # 收縮次數
         contractions = 0
         trough_prices = []
         in_pullback = False
-
         for i in range(20, len(close) - 5):
             try:
                 pc = (close.iloc[i] - close.iloc[i-5]) / close.iloc[i-5] * 100
                 vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
             except:
                 continue
-
             if not in_pullback and pc < -2 and vc < -15:
                 in_pullback = True
             if in_pullback and pc > 0:
@@ -136,29 +121,21 @@ def vcp_math_check(data):
                     trough_prices.append(close.iloc[i])
                     contractions += 1
                 in_pullback = False
-
-        # 放寬：若波動率處於 60 天低點，即使收縮次數為 0 也給過
+        # 波動率低點輔助判斷
         is_low_vol = latest_std <= std_min_60 * 1.05
         if contractions == 0 and not is_low_vol:
             return False
-
-        # RS 強度
+        # RS
         rs_lookback = min(60, len(close))
         rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
-
-        # 品質評級
+        # 品質
         quality_score = 0
         if contractions >= 3: quality_score += 2
         elif contractions >= 2: quality_score += 1
         if is_low_vol: quality_score += 2
         if rs >= 70: quality_score += 1
         if rs >= 85: quality_score += 1
-
         quality = "A" if quality_score >= 4 else "B" if quality_score >= 2 else "C"
-
-        vol_ma_20 = volume.rolling(20).mean()
-        recent_vol = volume.iloc[-3:].mean()
-
         return {
             "symbol": "",
             "price": round(float(close.iloc[-1]), 2),
@@ -177,13 +154,14 @@ def vcp_math_check(data):
         print(f"  vcp_math_check error: {e}")
         return False
 
-# ========== 主掃描函數 ==========
+# ========== 主掃描 ==========
 def full_scan():
-    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     stocks = get_all_stocks()
     total = len(stocks)
-    print(f"開始掃描，總股票數：{total}")
-
+    print(f"股票清單數量: {total}")
+    if total == 0:
+        return {"total": 0, "layer1": 0, "layer2": 0, "candidates": [], "error": "No stocks found (check FINMIND_TOKEN or network)"}
+    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     layer1_results = []
     for i in range(0, total, 100):
         batch = stocks[i:i+100]
@@ -198,24 +176,19 @@ def full_scan():
                 except:
                     pass
         time.sleep(0.3)
-
     layer1_count = len(layer1_results)
-    print(f"第一層通過：{layer1_count} 檔")
-
+    print(f"第一層通過: {layer1_count}")
     layer2_results = []
     for sid, df in layer1_results:
         result = vcp_math_check(df)
         if result:
             result["symbol"] = sid
             layer2_results.append(result)
-
     layer2_count = len(layer2_results)
-    print(f"第二層通過：{layer2_count} 檔")
-
+    print(f"第二層通過: {layer2_count}")
     layer2_results.sort(key=lambda x: (-x["rs_score"]))
     return {"total": total, "layer1": layer1_count, "layer2": layer2_count, "candidates": layer2_results[:10]}
 
-# ========== API 端點 ==========
 @app.get("/scan")
 def scan():
     try:
