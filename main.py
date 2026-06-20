@@ -2,6 +2,7 @@ import os
 import time
 import threading
 from datetime import datetime, timedelta
+
 import pandas as pd
 import numpy as np
 import requests
@@ -26,6 +27,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 scan_results = []          # 儲存最終候選股
 is_scanning = False        # 防止重複觸發
 scan_lock = threading.Lock()
+last_report_msg = "尚無報告"  # 供前端顯示
 
 # ========== Telegram 通知 ==========
 def send_telegram_msg(message):
@@ -177,9 +179,20 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 背景掃描任務（由 /start_scan 觸發） ==========
+# ========== 報告建立 ==========
+def build_report(total, results):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if not results:
+        return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
+    sorted_results = sorted(results, key=lambda x: -x["rs_score"])
+    msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
+    for i, c in enumerate(sorted_results[:10], 1):
+        msg += f"🔹 <b>{c['symbol']}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']}\n"
+    return msg
+
+# ========== 背景掃描任務 ==========
 def background_scanner():
-    global scan_results, is_scanning
+    global scan_results, is_scanning, last_report_msg
     with scan_lock:
         if is_scanning:
             return
@@ -211,8 +224,9 @@ def background_scanner():
         with scan_lock:
             scan_results = local_results
 
-        # 掃描完成，自動發送通知
+        # 掃描完成，自動發送通知並儲存報告
         report_msg = build_report(total, scan_results)
+        last_report_msg = report_msg
         send_telegram_msg(report_msg)
 
     except Exception as e:
@@ -221,20 +235,11 @@ def background_scanner():
         with scan_lock:
             is_scanning = False
 
-def build_report(total, results):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if not results:
-        return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
-    sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-    msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
-    for i, c in enumerate(sorted_results[:10], 1):
-        msg += f"🔹 <b>{c['symbol']}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']}\n"
-    return msg
-
 # ========== API 端點 ==========
 @app.get("/start_scan")
 def start_scan():
     """由 GitHub Actions 於 23:00 呼叫，啟動背景掃描"""
+    global is_scanning
     if is_scanning:
         return {"status": "already scanning"}
     thread = threading.Thread(target=background_scanner)
@@ -244,12 +249,47 @@ def start_scan():
 @app.get("/send_report")
 def send_report():
     """由 GitHub Actions 於 07:30 呼叫，發送報告並清空結果"""
-    global scan_results
-    total = len(get_filtered_stock_ids())  # 近似值，用於報告
+    global scan_results, last_report_msg
+    total = len(get_filtered_stock_ids())
     msg = build_report(total, scan_results)
+    last_report_msg = msg
     send_telegram_msg(msg)
     scan_results.clear()
     return {"status": "report sent"}
+
+@app.get("/latest_report")
+def latest_report():
+    """提供前端取得最近一次報告內容"""
+    global last_report_msg
+    return {"report": last_report_msg}
+
+@app.get("/scan")
+def scan():
+    """立即觸發同步掃描（供前端手動掃描使用）"""
+    try:
+        stocks = get_filtered_stock_ids()
+        total = len(stocks)
+        start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+        end_date = datetime.today().strftime("%Y-%m-%d")
+        layer1 = []
+        layer2 = []
+        for sid in stocks:
+            df = fetch_daily(sid, start_date, end_date)
+            if df is not None and minervini_check(df):
+                layer1.append(sid)
+                res = vcp_math_check(df)
+                if res:
+                    res["symbol"] = sid
+                    layer2.append(res)
+        layer2.sort(key=lambda x: -x["rs_score"])
+        return {
+            "total": total,
+            "layer1": len(layer1),
+            "layer2": len(layer2),
+            "candidates": layer2[:10]
+        }
+    except Exception as e:
+        return {"error": str(e), "total": 0, "layer1": 0, "layer2": 0, "candidates": []}
 
 @app.get("/health")
 def health():
