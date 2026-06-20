@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Start Scan (23:00)
         if: github.event.schedule == '0 15 * * *'
-        run: curl https://你的服務.onrender.com/start_scan
+        run: curl https://vcp-3ztx.onrender.com/start_scan
       - name: Send Report (07:30)
         if: github.event.schedule == '30 23 * * *'
-        run: curl https://你的服務.onrender.com/send_report
+        run: curl https://vcp-3ztx.onrender.com/send_report
