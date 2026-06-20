@@ -1,0 +1,20 @@
+name: Trigger Nightly Scan
+
+on:
+  schedule:
+    # 台灣時間 23:00 (UTC 15:00) 啟動掃描
+    - cron: '0 15 * * *'
+    # 台灣時間 07:30 (UTC 23:30) 發送報告
+    - cron: '30 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start Scan (23:00)
+        if: github.event.schedule == '0 15 * * *'
+        run: curl https://你的服務.onrender.com/start_scan
+      - name: Send Report (07:30)
+        if: github.event.schedule == '30 23 * * *'
+        run: curl https://你的服務.onrender.com/send_report
