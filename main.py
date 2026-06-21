@@ -21,7 +21,7 @@ app.add_middleware(
 
 # ========== 環境變數 ==========
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ========== 全域變數 ==========
@@ -87,7 +87,7 @@ def fetch_daily(sid, start_date, end_date):
         print(f"  {sid} 下載失敗：{e}")
         return None
 
-# ========== 第一層：Minervini 趨勢模板 ==========
+# ========== 第一層：Minervini 趨勢模板（放寬版） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -107,24 +107,25 @@ def minervini_check(data):
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
-        if pd.isna(ma150.iloc[-1]) or pd.isna(ma200.iloc[-1]):
+
+        # 放寬：收盤 > MA150 或 > MA200（滿足其一即可）
+        cond_ma = (last > ma150.iloc[-1]) or (last > ma200.iloc[-1])
+        if not cond_ma:
             return False
-        if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
-            return False
-        # MA200 趨勢放寬：只淘汰跌幅 > 2%
-        if len(ma200) >= 25:
-            if (ma200.iloc[-1] / ma200.iloc[-25] - 1) < -0.02:
-                return False
-        # 距 52 週高點 ≤ 25%
+
+        # 移除 MA200 趨勢檢查
+
+        # 距 52 週高點放寬至 65%
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
-            if pd.notna(high_52w) and last < high_52w * 0.75:
+            if pd.notna(high_52w) and last < high_52w * 0.65:
                 return False
+
         return True
     except:
         return False
 
-# ========== 第二層：VCP 波動收縮 ==========
+# ========== 第二層：VCP 波動收縮（放寬版） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -138,15 +139,9 @@ def vcp_math_check(data):
     try:
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
-        if pd.isna(vol_ma_20.iloc[-1]):
-            return None
+        vol_ratio = recent_vol / vol_ma_20.iloc[-1] if not pd.isna(vol_ma_20.iloc[-1]) else 0
 
-        rolling_std = close.rolling(20).std()
-        latest_std = rolling_std.iloc[-1]
-        if pd.isna(latest_std):
-            return None
-        std_min_60 = rolling_std.rolling(60, min_periods=20).min().iloc[-1]
-
+        # 計算收縮次數（保留原本邏輯）
         contractions = 0
         in_pullback = False
         for i in range(20, len(close)-5):
@@ -161,13 +156,17 @@ def vcp_math_check(data):
                 contractions += 1
                 in_pullback = False
 
-        is_low_vol = (latest_std <= std_min_60 * 1.05) if pd.notna(std_min_60) else False
-        if contractions == 0 and not is_low_vol:
+        # 放寬：只要有一次收縮，或是成交量放大（量比 > 1.2）即可通過
+        if contractions == 0 and vol_ratio <= 1.2:
             return None
 
-        rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-60]) / close.iloc[-60] * 200)))
-        qs = (1 if contractions >= 2 else 0) + (2 if is_low_vol else 0) + (1 if rs >= 70 else 0) + (1 if rs >= 85 else 0)
-        quality = "A" if qs >= 4 else "B" if qs >= 2 else "C"
+        # RS 計算
+        rs_lookback = min(60, len(close))
+        rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
+
+        # 品質評級（放寬加分項）
+        qs = (1 if contractions >= 2 else 0) + (1 if vol_ratio >= 1.5 else 0) + (1 if rs >= 70 else 0) + (1 if rs >= 85 else 0)
+        quality = "A" if qs >= 3 else "B" if qs >= 1 else "C"
 
         return {
             "symbol": data["stock_id"].iloc[0],
@@ -175,7 +174,7 @@ def vcp_math_check(data):
             "change_pct": round(float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100), 2),
             "rs_score": rs,
             "contractions": contractions,
-            "volume_ratio": round(float(recent_vol / vol_ma_20.iloc[-1]), 2),
+            "volume_ratio": round(float(vol_ratio), 2),
             "quality": quality,
         }
     except Exception as e:
