@@ -50,6 +50,23 @@ def send_telegram_msg(message):
     except Exception as e:
         print(f"Telegram 發送失敗：{e}")
 
+# ========== Numpy 轉換工具（避免 JSON 序列化錯誤） ==========
+def convert_numpy(obj):
+    """將 numpy 型別遞迴轉換為 Python 原生型別，確保可以 JSON 序列化"""
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy(v) for v in obj]
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
 # ========== 股票清單（快取 24 小時） ==========
 _stock_ids_cache = {"ids": [], "ts": 0}
 
@@ -339,12 +356,12 @@ def manual_scanner():
             if res:
                 res["symbol"] = sid
                 _manual_scan_status["results"].append(res)
-        _manual_scan_status["done"] = idx
+        _manual_scan_status["done"] = idx  # 即時更新已處理筆數
         elapsed = time.time() - loop_start
         time.sleep(max(0, 7.5 - elapsed))
     _manual_scan_status["running"] = False
 
-# ========== 夜間背景掃描 ==========
+# ========== 夜間背景掃描（供排程觸發） ==========
 def background_scanner():
     global scan_results, is_scanning, last_report_msg
     with scan_lock:
@@ -381,6 +398,7 @@ def background_scanner():
 # ========== API 端點 ==========
 @app.get("/start_scan_async")
 def start_scan_async():
+    """非同步手動掃描觸發"""
     global _manual_scan_status
     if _manual_scan_status["running"]:
         return {"status": "already running"}
@@ -390,10 +408,12 @@ def start_scan_async():
 
 @app.get("/start_scan")
 def start_scan():
+    """保留舊端點，指向非同步掃描"""
     return start_scan_async()
 
 @app.get("/scan_status")
 def scan_status():
+    """前端輪詢用：回傳即時進度"""
     return {
         "running": _manual_scan_status["running"],
         "total": _manual_scan_status["total"],
@@ -403,6 +423,7 @@ def scan_status():
 
 @app.get("/send_report")
 def send_report():
+    """由排程呼叫，發送夜間掃描 Telegram 報告並清空結果"""
     global scan_results, last_report_msg
     total = len(get_filtered_stock_ids())
     msg = build_report(total, scan_results)
@@ -413,6 +434,7 @@ def send_report():
 
 @app.get("/latest_report")
 def latest_report():
+    """前端取得最新報告內容"""
     global last_report_msg
     return {"report": last_report_msg}
 
@@ -422,22 +444,29 @@ def health():
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
+    """單股詳細診斷：回傳每一步的中間計算值"""
     result = {"symbol": symbol, "step1_fetch": None, "step2_minervini": None, "step3_vcp": None}
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     end_date = datetime.today().strftime("%Y-%m-%d")
     df = fetch_daily(symbol, start_date, end_date)
     if df is None:
         result["step1_fetch"] = "下載失敗（None）"
-        return result
+        return convert_numpy(result)
     result["step1_fetch"] = {
         "rows": len(df),
         "columns": df.columns.tolist(),
         "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無 close",
         "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "無 max",
     }
-    result["step2_minervini"] = minervini_check_with_debug(df)
-    if result["step2_minervini"].get("passed"):
+    mv = minervini_check_with_debug(df)
+    result["step2_minervini"] = mv
+    if mv.get("passed"):
         result["step3_vcp"] = vcp_math_check_with_debug(df)
     else:
         result["step3_vcp"] = "未執行（Minervini 未通過）"
-    return result
+    return convert_numpy(result)
+
+# ========== 若需本地測試 ==========
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
