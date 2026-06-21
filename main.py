@@ -181,6 +181,122 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
+
+
+def minervini_check_with_debug(data):
+    debug = {"passed": False, "reason": ""}
+    if data is None or len(data) < 200:
+        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
+        return debug
+
+    try:
+        close = data["close"]
+        high  = data["high"]
+    except KeyError as e:
+        debug["reason"] = f"缺少欄位：{e}"
+        return debug
+
+    close_clean = pd.to_numeric(close, errors='coerce').dropna()
+    high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
+    debug["close_clean_len"] = len(close_clean)
+    debug["high_clean_len"] = len(high_clean)
+
+    if len(close_clean) < 200 or len(high_clean) < 200:
+        debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high {len(high_clean)}"
+        return debug
+
+    try:
+        ma50  = close_clean.rolling(50).mean()
+        ma150 = close_clean.rolling(150).mean()
+        ma200 = close_clean.rolling(200).mean()
+        last  = close_clean.iloc[-1]
+
+        debug["last"] = round(last, 2)
+        debug["ma150"] = round(ma150.iloc[-1], 2) if not pd.isna(ma150.iloc[-1]) else "NaN"
+        debug["ma200"] = round(ma200.iloc[-1], 2) if not pd.isna(ma200.iloc[-1]) else "NaN"
+
+        cond_ma = (last > ma150.iloc[-1]) or (last > ma200.iloc[-1])
+        debug["cond_ma"] = cond_ma
+        if not cond_ma:
+            debug["reason"] = "收盤價未大於 MA150 或 MA200"
+            return debug
+
+        # 52 週高點條件
+        if len(high_clean) >= 200:
+            high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
+            debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
+            debug["high_52w_65pct"] = round(high_52w * 0.65, 2) if pd.notna(high_52w) else "NaN"
+            if pd.notna(high_52w) and last < high_52w * 0.65:
+                debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.65,2)}"
+                return debug
+        else:
+            debug["reason"] = "high 資料不足 200 筆"
+            return debug
+
+        debug["passed"] = True
+        return debug
+    except Exception as e:
+        debug["reason"] = f"計算錯誤：{str(e)}"
+        return debug
+
+def vcp_math_check_with_debug(data):
+    debug = {"passed": False, "reason": ""}
+    if data is None or len(data) < 60:
+        debug["reason"] = "資料筆數不足 60"
+        return debug
+
+    try:
+        close  = pd.to_numeric(data["close"], errors='coerce').dropna()
+        high   = pd.to_numeric(data["high"], errors='coerce').dropna()
+        low    = pd.to_numeric(data["low"], errors='coerce').dropna()
+        volume = pd.to_numeric(data["volume"], errors='coerce').dropna()
+    except KeyError as e:
+        debug["reason"] = f"缺少欄位：{e}"
+        return debug
+
+    if len(close) < 60 or len(volume) < 60:
+        debug["reason"] = f"去除 NaN 後資料不足：close {len(close)}, volume {len(volume)}"
+        return debug
+
+    try:
+        vol_ma_20 = volume.rolling(20).mean()
+        recent_vol = volume.iloc[-3:].mean()
+        if pd.isna(vol_ma_20.iloc[-1]):
+            debug["reason"] = "vol_ma_20 為 NaN"
+            return debug
+        vol_ratio = recent_vol / vol_ma_20.iloc[-1]
+        debug["vol_ratio"] = round(vol_ratio, 2)
+
+        # 收縮次數
+        contractions = 0
+        in_pullback = False
+        for i in range(20, len(close)-5):
+            try:
+                pc = (close.iloc[i] - close.iloc[i-5]) / close.iloc[i-5] * 100
+                vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
+            except:
+                continue
+            if not in_pullback and pc < -2 and vc < -15:
+                in_pullback = True
+            if in_pullback and pc > 0:
+                contractions += 1
+                in_pullback = False
+
+        debug["contractions"] = contractions
+
+        if contractions == 0 and vol_ratio <= 1.2:
+            debug["reason"] = f"無收縮且量比 {round(vol_ratio,2)} <= 1.2"
+            return debug
+
+        debug["passed"] = True
+        return debug
+    except Exception as e:
+        debug["reason"] = f"計算錯誤：{str(e)}"
+        return debug
+
+
+
+
 # ========== 報告建立 ==========
 def build_report(total, results):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -303,6 +419,44 @@ def latest_report():
 @app.get("/health")
 def health():
     return {"status": "ok", "scanning": is_scanning or _manual_scan_status["running"]}
+
+@app.get("/debug_scan")
+def debug_scan(symbol: str = "3008"):
+    """單股詳細診斷：回傳每一步的中間計算值"""
+    result = {
+        "symbol": symbol,
+        "step1_fetch": None,
+        "step2_minervini": None,
+        "step3_vcp": None
+    }
+
+    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+    end_date = datetime.today().strftime("%Y-%m-%d")
+
+    # Step 1: 下載資料
+    df = fetch_daily(symbol, start_date, end_date)
+    if df is None:
+        result["step1_fetch"] = "下載失敗（None）"
+        return result
+    result["step1_fetch"] = {
+        "rows": len(df),
+        "columns": df.columns.tolist(),
+        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無 close 欄位",
+        "tail_high": df["high"].tail(5).tolist() if "high" in df.columns else "無 high 欄位",
+    }
+
+    # Step 2: Minervini
+    mv = minervini_check_with_debug(df)
+    result["step2_minervini"] = mv
+
+    # Step 3: VCP (只在 Minervini 通過時才執行)
+    if mv.get("passed"):
+        vcp = vcp_math_check_with_debug(df)
+        result["step3_vcp"] = vcp
+    else:
+        result["step3_vcp"] = "未執行（Minervini 未通過）"
+
+    return result
 
 # ========== 若需本地測試 ==========
 if __name__ == "__main__":
