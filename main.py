@@ -150,6 +150,7 @@ def minervini_check(data):
 
 # ========== 第二層：VCP 波動收縮（放寬版，欄位修正） ==========
 def vcp_math_check(data):
+    """最終安全版 VCP 檢查"""
     if data is None or len(data) < 60:
         return None
 
@@ -161,13 +162,21 @@ def vcp_math_check(data):
     if close is None or volume is None or high is None or low is None:
         return None
 
-    close  = pd.to_numeric(close, errors='coerce').dropna()
-    high   = pd.to_numeric(high,  errors='coerce').dropna()
-    low    = pd.to_numeric(low,   errors='coerce').dropna()
-    volume = pd.to_numeric(volume, errors='coerce').dropna()
+    # 數值轉換並清除極端值
+    close  = pd.to_numeric(close, errors='coerce')
+    volume = pd.to_numeric(volume, errors='coerce')
+
+    # 只保留正值且合理範圍（防止離群值）
+    close  = close[(close > 0) & (close < 1e7)]
+    volume = volume[(volume > 0) & (volume < 1e10)]
 
     if len(close) < 60 or len(volume) < 60:
         return None
+
+    # 重新建立 DataFrame 確保索引對齊
+    df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
+    close  = df_clean["close"]
+    volume = df_clean["volume"]
 
     try:
         vol_ma_20 = volume.rolling(20).mean()
@@ -175,7 +184,6 @@ def vcp_math_check(data):
         if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
             return None
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
-        # 防止無窮大或 NaN
         if not np.isfinite(vol_ratio):
             return None
 
@@ -193,12 +201,18 @@ def vcp_math_check(data):
                 contractions += 1
                 in_pullback = False
 
-        # 放寬：只要有一次收縮，或是量比 > 1.2 即可通過
         if contractions == 0 and vol_ratio <= 1.2:
             return None
 
+        # RS 安全計算
         rs_lookback = min(60, len(close))
-        rs = min(99, max(1, int(50 + (close.iloc[-1] - close.iloc[-rs_lookback]) / close.iloc[-rs_lookback] * 200)))
+        past_close = close.iloc[-rs_lookback]
+        if past_close <= 0 or not np.isfinite(past_close):
+            return None
+        rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
+        if not np.isfinite(rs_raw):
+            return None
+        rs = int(max(1, min(99, round(float(rs_raw)))))
 
         qs = (1 if contractions >= 2 else 0) + (1 if vol_ratio >= 1.5 else 0) + (1 if rs >= 70 else 0) + (1 if rs >= 85 else 0)
         quality = "A" if qs >= 3 else "B" if qs >= 1 else "C"
@@ -215,6 +229,8 @@ def vcp_math_check(data):
     except Exception as e:
         print(f"  VCP error: {e}")
         return None
+
+
 
 
 # ========== 除錯版函數（用於 /debug_scan） ==========
@@ -267,6 +283,7 @@ def minervini_check_with_debug(data):
         return debug
 
 def vcp_math_check_with_debug(data):
+    """最終安全版 VCP 檢查（含 debug）"""
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 60:
         debug["reason"] = "資料筆數不足 60"
@@ -280,14 +297,18 @@ def vcp_math_check_with_debug(data):
         debug["reason"] = "缺少必要欄位"
         return debug
 
-    close  = pd.to_numeric(close, errors='coerce').dropna()
-    high   = pd.to_numeric(high,  errors='coerce').dropna()
-    low    = pd.to_numeric(low,   errors='coerce').dropna()
-    volume = pd.to_numeric(volume, errors='coerce').dropna()
+    close  = pd.to_numeric(close, errors='coerce')
+    volume = pd.to_numeric(volume, errors='coerce')
+    close  = close[(close > 0) & (close < 1e7)]
+    volume = volume[(volume > 0) & (volume < 1e10)]
 
     if len(close) < 60 or len(volume) < 60:
-        debug["reason"] = f"去除 NaN 後資料不足：close {len(close)}, volume {len(volume)}"
+        debug["reason"] = f"有效資料不足：close {len(close)}, volume {len(volume)}"
         return debug
+
+    df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
+    close  = df_clean["close"]
+    volume = df_clean["volume"]
 
     try:
         vol_ma_20 = volume.rolling(20).mean()
@@ -299,7 +320,7 @@ def vcp_math_check_with_debug(data):
         if not np.isfinite(vol_ratio):
             debug["reason"] = "vol_ratio 為無限大或 NaN"
             return debug
-        debug["vol_ratio"] = round(vol_ratio, 2)
+        debug["vol_ratio"] = round(float(vol_ratio), 2)
 
         contractions = 0
         in_pullback = False
@@ -316,6 +337,19 @@ def vcp_math_check_with_debug(data):
                 in_pullback = False
 
         debug["contractions"] = contractions
+
+        rs_lookback = min(60, len(close))
+        past_close = close.iloc[-rs_lookback]
+        if past_close <= 0 or not np.isfinite(past_close):
+            debug["reason"] = "歷史收盤價無效"
+            return debug
+        rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
+        if not np.isfinite(rs_raw):
+            debug["reason"] = "RS 計算結果為無限大"
+            return debug
+        rs = int(max(1, min(99, round(float(rs_raw)))))
+        debug["rs"] = rs
+
         if contractions == 0 and vol_ratio <= 1.2:
             debug["reason"] = f"無收縮且量比 {round(vol_ratio,2)} <= 1.2"
             return debug
