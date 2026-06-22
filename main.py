@@ -172,9 +172,12 @@ def vcp_math_check(data):
     try:
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
-        if pd.isna(vol_ma_20.iloc[-1]):
+        if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
             return None
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
+        # 防止無窮大或 NaN
+        if not np.isfinite(vol_ratio):
+            return None
 
         contractions = 0
         in_pullback = False
@@ -212,6 +215,7 @@ def vcp_math_check(data):
     except Exception as e:
         print(f"  VCP error: {e}")
         return None
+
 
 # ========== 除錯版函數（用於 /debug_scan） ==========
 def minervini_check_with_debug(data):
@@ -288,10 +292,13 @@ def vcp_math_check_with_debug(data):
     try:
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
-        if pd.isna(vol_ma_20.iloc[-1]):
-            debug["reason"] = "vol_ma_20 為 NaN"
+        if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
+            debug["reason"] = "vol_ma_20 為 NaN 或 0"
             return debug
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
+        if not np.isfinite(vol_ratio):
+            debug["reason"] = "vol_ratio 為無限大或 NaN"
+            return debug
         debug["vol_ratio"] = round(vol_ratio, 2)
 
         contractions = 0
