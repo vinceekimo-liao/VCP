@@ -112,7 +112,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini 趨勢模板（放寬版，欄位修正） ==========
+# ========== 第一層：Minervini 趨勢模板（放寬版） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -148,9 +148,9 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP 波動收縮（放寬版，欄位修正） ==========
+# ========== 第二層：VCP 波動收縮（黃金微調版） ==========
 def vcp_math_check(data):
-    """最終安全版 VCP 檢查"""
+    """VCP 檢查，使用更精準的收縮定義與過濾邏輯"""
     if data is None or len(data) < 60:
         return None
 
@@ -162,18 +162,15 @@ def vcp_math_check(data):
     if close is None or volume is None or high is None or low is None:
         return None
 
-    # 數值轉換並清除極端值
+    # 數值清洗
     close  = pd.to_numeric(close, errors='coerce')
     volume = pd.to_numeric(volume, errors='coerce')
-
-    # 只保留正值且合理範圍（防止離群值）
     close  = close[(close > 0) & (close < 1e7)]
     volume = volume[(volume > 0) & (volume < 1e10)]
 
     if len(close) < 60 or len(volume) < 60:
         return None
 
-    # 重新建立 DataFrame 確保索引對齊
     df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
     close  = df_clean["close"]
     volume = df_clean["volume"]
@@ -187,6 +184,7 @@ def vcp_math_check(data):
         if not np.isfinite(vol_ratio):
             return None
 
+        # ── 優化後的收縮計數 ──
         contractions = 0
         in_pullback = False
         for i in range(20, len(close)-5):
@@ -195,16 +193,20 @@ def vcp_math_check(data):
                 vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
             except:
                 continue
-            if not in_pullback and pc < -2 and vc < -15:
+            # 較嚴格的拉回定義：跌超過 3% 且量縮超過 20%
+            if not in_pullback and pc < -3 and vc < -20:
                 in_pullback = True
-            if in_pullback and pc > 0:
+            # 必須是明顯止跌回升（漲超過 1.5%）才算完成一次收縮
+            if in_pullback and pc > 1.5:
                 contractions += 1
                 in_pullback = False
 
-        if contractions == 0 and vol_ratio <= 1.2:
+        # ── 最終過濾門檻 ──
+        # 如果完全沒有收縮型態，要求近期有明顯放量
+        if contractions == 0 and vol_ratio < 1.2:
             return None
 
-        # RS 安全計算
+        # RS 計算（安全版）
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
         if past_close <= 0 or not np.isfinite(past_close):
@@ -214,8 +216,9 @@ def vcp_math_check(data):
             return None
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        qs = (1 if contractions >= 2 else 0) + (1 if vol_ratio >= 1.5 else 0) + (1 if rs >= 70 else 0) + (1 if rs >= 85 else 0)
-        quality = "A" if qs >= 3 else "B" if qs >= 1 else "C"
+        # ── 品質評分（微調後） ──
+        qs = (1 if contractions >= 1 else 0) + (1 if vol_ratio >= 1.2 else 0) + (1 if rs >= 80 else 0)
+        quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
         return {
             "symbol": data["stock_id"].iloc[0] if "stock_id" in data.columns else "",
@@ -230,60 +233,8 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-
-
-
-# ========== 除錯版函數（用於 /debug_scan） ==========
-def minervini_check_with_debug(data):
-    debug = {"passed": False, "reason": ""}
-    if data is None or len(data) < 200:
-        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
-        return debug
-
-    close = _get_col(data, "close", "Close")
-    high  = _get_col(data, "max", "high", "High")
-    if close is None or high is None:
-        debug["reason"] = f"缺少欄位：close={close is not None}, high/max={high is not None}"
-        return debug
-
-    close_clean = pd.to_numeric(close, errors='coerce').dropna()
-    high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
-    if len(close_clean) < 200 or len(high_clean) < 200:
-        debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high/max {len(high_clean)}"
-        return debug
-
-    try:
-        ma50  = close_clean.rolling(50).mean()
-        ma150 = close_clean.rolling(150).mean()
-        ma200 = close_clean.rolling(200).mean()
-        last  = close_clean.iloc[-1]
-
-        debug["last"] = round(last, 2)
-        debug["ma150"] = round(ma150.iloc[-1], 2) if not pd.isna(ma150.iloc[-1]) else "NaN"
-        debug["ma200"] = round(ma200.iloc[-1], 2) if not pd.isna(ma200.iloc[-1]) else "NaN"
-
-        cond_ma = (last > ma150.iloc[-1]) or (last > ma200.iloc[-1])
-        debug["cond_ma"] = cond_ma
-        if not cond_ma:
-            debug["reason"] = "收盤價未大於 MA150 或 MA200"
-            return debug
-
-        if len(high_clean) >= 200:
-            high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
-            debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
-            if pd.notna(high_52w):
-                debug["high_52w_65pct"] = round(high_52w * 0.65, 2)
-                if last < high_52w * 0.65:
-                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.65,2)}"
-                    return debug
-        debug["passed"] = True
-        return debug
-    except Exception as e:
-        debug["reason"] = f"計算錯誤：{str(e)}"
-        return debug
-
+# ========== 除錯版 VCP（黃金微調版） ==========
 def vcp_math_check_with_debug(data):
-    """最終安全版 VCP 檢查（含 debug）"""
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 60:
         debug["reason"] = "資料筆數不足 60"
@@ -330,9 +281,9 @@ def vcp_math_check_with_debug(data):
                 vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
             except:
                 continue
-            if not in_pullback and pc < -2 and vc < -15:
+            if not in_pullback and pc < -3 and vc < -20:
                 in_pullback = True
-            if in_pullback and pc > 0:
+            if in_pullback and pc > 1.5:
                 contractions += 1
                 in_pullback = False
 
@@ -350,8 +301,8 @@ def vcp_math_check_with_debug(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
         debug["rs"] = rs
 
-        if contractions == 0 and vol_ratio <= 1.2:
-            debug["reason"] = f"無收縮且量比 {round(vol_ratio,2)} <= 1.2"
+        if contractions == 0 and vol_ratio < 1.2:
+            debug["reason"] = f"無收縮且量比 {round(vol_ratio,2)} < 1.2"
             return debug
 
         debug["passed"] = True
@@ -397,12 +348,12 @@ def manual_scanner():
             if res:
                 res["symbol"] = sid
                 _manual_scan_status["results"].append(res)
-        _manual_scan_status["done"] = idx  # 即時更新已處理筆數
+        _manual_scan_status["done"] = idx
         elapsed = time.time() - loop_start
         time.sleep(max(0, 7.5 - elapsed))
     _manual_scan_status["running"] = False
 
-# ========== 夜間背景掃描（供排程觸發） ==========
+# ========== 夜間背景掃描 ==========
 def background_scanner():
     global scan_results, is_scanning, last_report_msg
     with scan_lock:
@@ -439,7 +390,6 @@ def background_scanner():
 # ========== API 端點 ==========
 @app.get("/start_scan_async")
 def start_scan_async():
-    """非同步手動掃描觸發"""
     global _manual_scan_status
     if _manual_scan_status["running"]:
         return {"status": "already running"}
@@ -449,12 +399,10 @@ def start_scan_async():
 
 @app.get("/start_scan")
 def start_scan():
-    """保留舊端點，指向非同步掃描"""
     return start_scan_async()
 
 @app.get("/scan_status")
 def scan_status():
-    """前端輪詢用：回傳即時進度"""
     return {
         "running": _manual_scan_status["running"],
         "total": _manual_scan_status["total"],
@@ -464,7 +412,6 @@ def scan_status():
 
 @app.get("/send_report")
 def send_report():
-    """由排程呼叫，發送夜間掃描 Telegram 報告並清空結果"""
     global scan_results, last_report_msg
     total = len(get_filtered_stock_ids())
     msg = build_report(total, scan_results)
@@ -475,7 +422,6 @@ def send_report():
 
 @app.get("/latest_report")
 def latest_report():
-    """前端取得最新報告內容"""
     global last_report_msg
     return {"report": last_report_msg}
 
@@ -485,7 +431,6 @@ def health():
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    """單股詳細診斷：回傳每一步的中間計算值"""
     result = {"symbol": symbol, "step1_fetch": None, "step2_minervini": None, "step3_vcp": None}
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     end_date = datetime.today().strftime("%Y-%m-%d")
@@ -507,7 +452,49 @@ def debug_scan(symbol: str = "3008"):
         result["step3_vcp"] = "未執行（Minervini 未通過）"
     return convert_numpy(result)
 
-# ========== 若需本地測試 ==========
+# 需要保留 minervini_check_with_debug
+def minervini_check_with_debug(data):
+    debug = {"passed": False, "reason": ""}
+    if data is None or len(data) < 200:
+        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
+        return debug
+    close = _get_col(data, "close", "Close")
+    high  = _get_col(data, "max", "high", "High")
+    if close is None or high is None:
+        debug["reason"] = f"缺少欄位：close={close is not None}, high/max={high is not None}"
+        return debug
+    close_clean = pd.to_numeric(close, errors='coerce').dropna()
+    high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
+    if len(close_clean) < 200 or len(high_clean) < 200:
+        debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high/max {len(high_clean)}"
+        return debug
+    try:
+        ma50  = close_clean.rolling(50).mean()
+        ma150 = close_clean.rolling(150).mean()
+        ma200 = close_clean.rolling(200).mean()
+        last  = close_clean.iloc[-1]
+        debug["last"] = round(last, 2)
+        debug["ma150"] = round(ma150.iloc[-1], 2) if not pd.isna(ma150.iloc[-1]) else "NaN"
+        debug["ma200"] = round(ma200.iloc[-1], 2) if not pd.isna(ma200.iloc[-1]) else "NaN"
+        cond_ma = (last > ma150.iloc[-1]) or (last > ma200.iloc[-1])
+        debug["cond_ma"] = cond_ma
+        if not cond_ma:
+            debug["reason"] = "收盤價未大於 MA150 或 MA200"
+            return debug
+        if len(high_clean) >= 200:
+            high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
+            debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
+            if pd.notna(high_52w):
+                debug["high_52w_65pct"] = round(high_52w * 0.65, 2)
+                if last < high_52w * 0.65:
+                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.65,2)}"
+                    return debug
+        debug["passed"] = True
+        return debug
+    except Exception as e:
+        debug["reason"] = f"計算錯誤：{str(e)}"
+        return debug
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
