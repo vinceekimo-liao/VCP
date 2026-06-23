@@ -128,7 +128,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（終極放寬版） ==========
+# ========== 第二層：VCP（收緊版，目標 100 檔以內） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -157,7 +157,7 @@ def vcp_math_check(data):
             return None
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
 
-        # 計算收縮次數（範圍 5 ~ 最後）
+        # 計算收縮次數
         contractions = 0
         in_pullback = False
         for i in range(5, len(close)):
@@ -175,11 +175,6 @@ def vcp_math_check(data):
         # 當日漲幅
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
 
-        # 終極放寬門檻
-        passed_vcp = (contractions > 0) or (vol_ratio >= 0.85) or (today_change > 2.0 and vol_ratio > 1.0)
-        if not passed_vcp:
-            return None
-
         # RS 計算
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
@@ -188,7 +183,27 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        qs = (1 if contractions >= 2 else 0) + (1 if vol_ratio >= 1.2 else 0) + (1 if rs >= 70 else 0)
+        # ── 收緊後的過濾條件 ──
+        # 基本門檻：RS >= 60（排除弱勢股）
+        if rs < 60:
+            return None
+
+        # 通過條件（滿足任一組合）：
+        # 1. 有明顯收縮（contractions >= 2）且量比不低於 0.9
+        cond1 = (contractions >= 2) and (vol_ratio >= 0.9)
+        # 2. 有至少一次收縮且近期帶量（量比 >= 1.1）
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.1)
+        # 3. 強勢突破：今日漲幅 > 2% 且量比 > 1.2
+        cond3 = (today_change > 2.0) and (vol_ratio > 1.2)
+
+        if not (cond1 or cond2 or cond3):
+            return None
+
+        # 品質評分
+        qs = 0
+        if contractions >= 2: qs += 1
+        if vol_ratio >= 1.2: qs += 1
+        if rs >= 80: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
         return {
@@ -204,21 +219,21 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# 除錯版函數（保留原樣式，並加入詳細資訊）
+# ========== 除錯版函數 ==========
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
-        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
+        debug["reason"] = f"資料筆數不足"
         return debug
     close = _get_col(data, "close", "Close")
     high  = _get_col(data, "max", "high", "High")
     if close is None or high is None:
-        debug["reason"] = f"缺少欄位"
+        debug["reason"] = "缺少欄位"
         return debug
     close_clean = pd.to_numeric(close, errors='coerce').dropna()
     high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
     if len(close_clean) < 200 or len(high_clean) < 200:
-        debug["reason"] = f"有效資料不足"
+        debug["reason"] = "有效資料不足"
         return debug
     try:
         ma150 = close_clean.rolling(150).mean()
@@ -235,7 +250,7 @@ def minervini_check_with_debug(data):
         if len(high_clean) >= 200:
             high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
             if pd.notna(high_52w) and last < high_52w * 0.65:
-                debug["reason"] = f"距 52 週高點太遠"
+                debug["reason"] = "距 52 週高點太遠"
                 return debug
         debug["passed"] = True
         return debug
@@ -258,7 +273,7 @@ def vcp_math_check_with_debug(data):
     df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
     df_clean = df_clean[(df_clean["close"] > 0) & (df_clean["volume"] > 0)]
     if len(df_clean) < 60:
-        debug["reason"] = f"有效資料不足"
+        debug["reason"] = "有效資料不足"
         return debug
     close  = df_clean["close"]
     volume = df_clean["volume"]
@@ -286,10 +301,24 @@ def vcp_math_check_with_debug(data):
         debug["contractions"] = contractions
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
         debug["today_change"] = round(today_change, 2)
-        passed = (contractions > 0) or (vol_ratio >= 0.85) or (today_change > 2.0 and vol_ratio > 1.0)
+        # RS
+        rs_lookback = min(60, len(close))
+        past_close = close.iloc[-rs_lookback]
+        if past_close <= 0:
+            debug["reason"] = "歷史收盤價無效"
+            return debug
+        rs = int(max(1, min(99, round(float(50 + (close.iloc[-1] - past_close) / past_close * 200)))))
+        debug["rs"] = rs
+        if rs < 60:
+            debug["reason"] = f"RS < 60 (實際 {rs})"
+            return debug
+        cond1 = (contractions >= 2) and (vol_ratio >= 0.9)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.1)
+        cond3 = (today_change > 2.0) and (vol_ratio > 1.2)
+        passed = cond1 or cond2 or cond3
         debug["passed_vcp"] = passed
         if not passed:
-            debug["reason"] = f"未通過終極放寬門檻（contractions={contractions}, vol_ratio={round(vol_ratio,2)}, change={round(today_change,2)}）"
+            debug["reason"] = f"未滿足任一條件 (c1:{cond1}, c2:{cond2}, c3:{cond3})"
             return debug
         debug["passed"] = True
         return debug
@@ -303,7 +332,7 @@ def build_report(total, results):
         return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
     msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
-    for i, c in enumerate(sorted_results[:10], 1):
+    for i, c in enumerate(sorted_results[:15], 1):
         msg += f"🔹 <b>{c['symbol']}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']}\n"
     return msg
 
