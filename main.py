@@ -183,14 +183,15 @@ def vcp_math_check(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
         # ── 最終過濾條件 ──
+                # ── 收緊後的過濾條件 ──
         if rs < 60:
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 0.9)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.1)
-        cond3 = (today_change > 2.0) and (vol_ratio > 1.2)
-        cond4 = (contractions >= 3) and (vol_ratio >= 0.7) and (rs >= 85)
-        cond5 = (contractions >= 1) and (vol_ratio >= 0.8) and (rs >= 90)
+        cond1 = (contractions >= 2) and (vol_ratio >= 0.95)                     # 稍微提高量比門檻
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.2)                      # 維持不變
+        cond3 = (today_change > 2.0) and (vol_ratio > 1.2)                      # 維持不變
+        cond4 = (contractions >= 4) and (vol_ratio >= 0.8) and (rs >= 90)       # 提高收縮次數與 RS
+        cond5 = (contractions >= 2) and (vol_ratio >= 0.85) and (rs >= 95)      # 收縮次數與 RS 提高
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
