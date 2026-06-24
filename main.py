@@ -172,7 +172,6 @@ def vcp_math_check(data):
                 contractions += 1
                 in_pullback = False
 
-        # 當日漲幅
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
 
         # RS 計算
@@ -183,20 +182,17 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # ── 收緊後的過濾條件 ──
-        # 基本門檻：RS >= 60（排除弱勢股）
+        # ── 最終過濾條件 ──
         if rs < 60:
             return None
 
-        # 通過條件（滿足任一組合）：
-        # 1. 有明顯收縮（contractions >= 2）且量比不低於 0.9
         cond1 = (contractions >= 2) and (vol_ratio >= 0.9)
-        # 2. 有至少一次收縮且近期帶量（量比 >= 1.1）
         cond2 = (contractions >= 1) and (vol_ratio >= 1.1)
-        # 3. 強勢突破：今日漲幅 > 2% 且量比 > 1.2
         cond3 = (today_change > 2.0) and (vol_ratio > 1.2)
+        cond4 = (contractions >= 3) and (vol_ratio >= 0.7) and (rs >= 85)
+        cond5 = (contractions >= 1) and (vol_ratio >= 0.8) and (rs >= 90)
 
-        if not (cond1 or cond2 or cond3):
+        if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
         # 品質評分
