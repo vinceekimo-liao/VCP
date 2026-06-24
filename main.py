@@ -128,7 +128,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（收緊版，目標 100 檔以內） ==========
+# ========== 第二層：VCP（最新放寬版） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -311,10 +311,12 @@ def vcp_math_check_with_debug(data):
         cond1 = (contractions >= 2) and (vol_ratio >= 0.9)
         cond2 = (contractions >= 1) and (vol_ratio >= 1.1)
         cond3 = (today_change > 2.0) and (vol_ratio > 1.2)
-        passed = cond1 or cond2 or cond3
+        cond4 = (contractions >= 3) and (vol_ratio >= 0.7) and (rs >= 85)
+        cond5 = (contractions >= 1) and (vol_ratio >= 0.8) and (rs >= 90)
+        passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
-            debug["reason"] = f"未滿足任一條件 (c1:{cond1}, c2:{cond2}, c3:{cond3})"
+            debug["reason"] = f"未滿足任一條件 (c1:{cond1}, c2:{cond2}, c3:{cond3}, c4:{cond4}, c5:{cond5})"
             return debug
         debug["passed"] = True
         return debug
