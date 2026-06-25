@@ -25,8 +25,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TEL
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ========== 全域變數 ==========
-scan_results = []
-is_scanning = False
+scan_results = []          # 最後一次掃描的結果（夜間或手動）
+any_scan_running = False   # 統一防重入旗標
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
 
@@ -82,6 +82,7 @@ def get_filtered_stock_ids():
     return ids
 
 def fetch_daily(sid, start_date, end_date):
+    """下載單一股票歷史日線，不回傳例外（由呼叫端處理）"""
     api = get_api()
     try:
         data = api.taiwan_stock_daily(stock_id=sid, start_date=start_date, end_date=end_date)
@@ -92,7 +93,7 @@ def fetch_daily(sid, start_date, end_date):
         data.set_index("date", inplace=True)
         return data
     except Exception as e:
-        print(f"  {sid} 下載失敗：{e}")
+        # 不印出太多錯誤，只在除錯時記錄
         return None
 
 def _get_col(data, *names):
@@ -128,7 +129,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（收緊版，目標 100 檔以內） ==========
+# ========== 第二層：VCP（收緊版） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -186,17 +187,15 @@ def vcp_math_check(data):
         if rs < 60:
             return None
 
-        # 條件組合（滿足任一即可通過）
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.0)                     # 明顯收縮且量能不差
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.3)                    # 有一次收縮且顯著帶量
-        cond3 = (today_change > 2.0) and (vol_ratio > 1.3)                    # 強勢突破
-        cond4 = (contractions >= 5) and (vol_ratio >= 0.8) and (rs >= 92)     # 高收縮＋高RS，量能稍寬容
-        cond5 = (contractions >= 3) and (vol_ratio >= 0.9) and (rs >= 95)     # 收縮次數中等但RS極高
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.0)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.3)
+        cond3 = (today_change > 2.0) and (vol_ratio > 1.3)
+        cond4 = (contractions >= 5) and (vol_ratio >= 0.8) and (rs >= 92)
+        cond5 = (contractions >= 3) and (vol_ratio >= 0.9) and (rs >= 95)
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
-        # 品質評分
         qs = 0
         if contractions >= 2: qs += 1
         if vol_ratio >= 1.2: qs += 1
@@ -216,7 +215,7 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數 ==========
+# ========== 除錯版函數（與正式版相同） ==========
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
@@ -298,7 +297,6 @@ def vcp_math_check_with_debug(data):
         debug["contractions"] = contractions
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
         debug["today_change"] = round(today_change, 2)
-        # RS
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
         if past_close <= 0:
@@ -335,11 +333,26 @@ def build_report(total, results):
         msg += f"🔹 <b>{c['symbol']}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']}\n"
     return msg
 
-# 非同步掃描
+# ========== 統一掃描函數（避免同時執行） ==========
+def _run_scan(scanner_func, *args):
+    """執行掃描，並設定 any_scan_running 旗標"""
+    global any_scan_running
+    with scan_lock:
+        if any_scan_running:
+            print("⚠️ 已有掃描在執行中，略過本次觸發")
+            return
+        any_scan_running = True
+    try:
+        scanner_func(*args)
+    finally:
+        with scan_lock:
+            any_scan_running = False
+
+# ========== 手動掃描（由 /start_scan_async 觸發） ==========
 _manual_scan_status = {"running": False, "total": 0, "done": 0, "results": []}
 
 def manual_scanner():
-    global _manual_scan_status
+    global _manual_scan_status, scan_results
     _manual_scan_status["running"] = True
     _manual_scan_status["done"] = 0
     _manual_scan_status["results"] = []
@@ -362,61 +375,59 @@ def manual_scanner():
         if idx % 100 == 0:
             print(f"📊 進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(_manual_scan_status['results'])}")
         elapsed = time.time() - loop_start
-        time.sleep(max(0, 7.5 - elapsed))
+        time.sleep(max(0, 8.0 - elapsed))   # 每檔間隔 8 秒，確保每小時 ≤ 450 次
     _manual_scan_status["running"] = False
-    # 同步到手動報告用的全域變數
-    global scan_results
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    print(f"✅ 掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
+    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
-# 背景掃描（夜間）
+# ========== 背景夜間掃描（由排程觸發） ==========
 def background_scanner():
-    global scan_results, is_scanning, last_report_msg
+    global scan_results, last_report_msg
+    stocks = get_filtered_stock_ids()
+    total = len(stocks)
+    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+    end_date = datetime.today().strftime("%Y-%m-%d")
+    local_results = []
+    layer1_pass = 0
+    for idx, sid in enumerate(stocks, 1):
+        loop_start = time.time()
+        df = fetch_daily(sid, start_date, end_date)
+        if df is not None and minervini_check(df):
+            layer1_pass += 1
+            res = vcp_math_check(df)
+            if res:
+                local_results.append(res)
+        if idx % 100 == 0:
+            print(f"📊 背景掃描進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(local_results)}")
+        elapsed = time.time() - loop_start
+        time.sleep(max(0, 8.0 - elapsed))
     with scan_lock:
-        if is_scanning: return
-        is_scanning = True
-    try:
-        stocks = get_filtered_stock_ids()
-        total = len(stocks)
-        start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
-        end_date = datetime.today().strftime("%Y-%m-%d")
-        local_results = []
-        layer1_pass = 0
-        for idx, sid in enumerate(stocks, 1):
-            loop_start = time.time()
-            df = fetch_daily(sid, start_date, end_date)
-            if df is not None and minervini_check(df):
-                layer1_pass += 1
-                res = vcp_math_check(df)
-                if res:
-                    local_results.append(res)
-            if idx % 100 == 0:
-                print(f"📊 背景掃描進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(local_results)}")
-            elapsed = time.time() - loop_start
-            time.sleep(max(0, 7.5 - elapsed))
-        with scan_lock:
-            scan_results = local_results
-        last_report_msg = build_report(total, scan_results)
-        send_telegram_msg(last_report_msg)
-    except Exception as e:
-        print(f"背景掃描失敗：{e}")
-    finally:
-        with scan_lock: is_scanning = False
+        scan_results = local_results
+    last_report_msg = build_report(total, scan_results)
+    send_telegram_msg(last_report_msg)
+    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
-# API 端點
+# ========== API 端點 ==========
 @app.get("/start_scan_async")
 def start_scan_async():
-    global _manual_scan_status
-    if _manual_scan_status["running"]:
-        return {"status": "already running"}
-    thread = threading.Thread(target=manual_scanner)
+    """手動掃描（前端按鈕）"""
+    global any_scan_running
+    if any_scan_running:
+        return {"status": "already running (manual or night scan)"}
+    thread = threading.Thread(target=_run_scan, args=(manual_scanner,))
     thread.start()
     return {"status": "started"}
 
 @app.get("/start_scan")
 def start_scan():
-    return start_scan_async()
+    """給排程呼叫的端點（用於夜間掃描）"""
+    global any_scan_running
+    if any_scan_running:
+        return {"status": "already running"}
+    thread = threading.Thread(target=_run_scan, args=(background_scanner,))
+    thread.start()
+    return {"status": "started"}
 
 @app.get("/scan_status")
 def scan_status():
@@ -444,7 +455,7 @@ def latest_report():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "scanning": is_scanning or _manual_scan_status["running"]}
+    return {"status": "ok", "scanning": any_scan_running}
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
