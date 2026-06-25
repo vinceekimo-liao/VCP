@@ -128,7 +128,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（最新放寬版） ==========
+# ========== 第二層：VCP（收緊版，目標 100 檔以內） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -182,16 +182,16 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # ── 最終過濾條件 ──
-                # ── 收緊後的過濾條件 ──
+        # ── 收緊後的過濾條件 ──
         if rs < 60:
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 0.95)                     # 稍微提高量比門檻
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.2)                      # 維持不變
-        cond3 = (today_change > 2.0) and (vol_ratio > 1.2)                      # 維持不變
-        cond4 = (contractions >= 4) and (vol_ratio >= 0.8) and (rs >= 90)       # 提高收縮次數與 RS
-        cond5 = (contractions >= 2) and (vol_ratio >= 0.85) and (rs >= 95)      # 收縮次數與 RS 提高
+        # 條件組合（滿足任一即可通過）
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.0)                     # 明顯收縮且量能不差
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.3)                    # 有一次收縮且顯著帶量
+        cond3 = (today_change > 2.0) and (vol_ratio > 1.3)                    # 強勢突破
+        cond4 = (contractions >= 5) and (vol_ratio >= 0.8) and (rs >= 92)     # 高收縮＋高RS，量能稍寬容
+        cond5 = (contractions >= 3) and (vol_ratio >= 0.9) and (rs >= 95)     # 收縮次數中等但RS極高
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
@@ -309,11 +309,11 @@ def vcp_math_check_with_debug(data):
         if rs < 60:
             debug["reason"] = f"RS < 60 (實際 {rs})"
             return debug
-        cond1 = (contractions >= 2) and (vol_ratio >= 0.9)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.1)
-        cond3 = (today_change > 2.0) and (vol_ratio > 1.2)
-        cond4 = (contractions >= 3) and (vol_ratio >= 0.7) and (rs >= 85)
-        cond5 = (contractions >= 1) and (vol_ratio >= 0.8) and (rs >= 90)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.0)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.3)
+        cond3 = (today_change > 2.0) and (vol_ratio > 1.3)
+        cond4 = (contractions >= 5) and (vol_ratio >= 0.8) and (rs >= 92)
+        cond5 = (contractions >= 3) and (vol_ratio >= 0.9) and (rs >= 95)
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
@@ -364,13 +364,10 @@ def manual_scanner():
         elapsed = time.time() - loop_start
         time.sleep(max(0, 7.5 - elapsed))
     _manual_scan_status["running"] = False
-
-    # ── 同步到手動報告用的全域變數 ──
+    # 同步到手動報告用的全域變數
     global scan_results
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    # ──────────────────────────────────
-
     print(f"✅ 掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
 # 背景掃描（夜間）
