@@ -364,7 +364,14 @@ def manual_scanner():
         elapsed = time.time() - loop_start
         time.sleep(max(0, 7.5 - elapsed))
     _manual_scan_status["running"] = False
-    print(f"✅ 掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(_manual_scan_status['results'])} 檔")
+
+    # ── 同步到手動報告用的全域變數 ──
+    global scan_results
+    with scan_lock:
+        scan_results = _manual_scan_status["results"]
+    # ──────────────────────────────────
+
+    print(f"✅ 掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
 # 背景掃描（夜間）
 def background_scanner():
