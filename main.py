@@ -250,7 +250,9 @@ def build_report(total, results):
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
     msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
     for i, c in enumerate(sorted_results[:15], 1):
-        msg += f"🔹 <b>{c['symbol']}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']}\n"
+        symbol = c['symbol']
+        yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
+        msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
 # ========== 掃描執行器（防止重入） ==========
