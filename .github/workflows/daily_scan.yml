@@ -2,30 +2,20 @@ name: Nightly VCP Scan
 
 on:
   schedule:
-    # 台灣時間 23:00 (UTC 15:00) 開始掃描
+    # 台灣時間 23:00 (UTC 15:00) → 啟動掃描
     - cron: '0 15 * * *'
-  workflow_dispatch:   # 允許手動觸發測試
+    # 台灣時間 07:30 (UTC 23:30) → 發送報告
+    - cron: '30 23 * * *'
+  workflow_dispatch:
 
 jobs:
-  scan:
+  trigger:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 小時，足夠掃完 1500 檔
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Start scan at 23:00
+        if: github.event.schedule == '0 15 * * *'
+        run: curl -X GET https://vcp-3ztx.onrender.com/start_scan
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run nightly scan
-        env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scan_and_notify.py
+      - name: Send report at 07:30
+        if: github.event.schedule == '30 23 * * *'
+        run: curl -X GET https://vcp-3ztx.onrender.com/send_report
