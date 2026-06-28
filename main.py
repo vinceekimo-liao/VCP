@@ -32,9 +32,9 @@ scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
 
 # 請求頻率控制 ── 滑動窗口 (每小時 500 次)
-_request_times = deque()        # 儲存最近 500 次請求的時間戳
-REQUEST_LIMIT = 500             # 每小時上限
-REQUEST_WINDOW = 3600           # 1 小時 (秒)
+_request_times = deque()
+REQUEST_LIMIT = 500
+REQUEST_WINDOW = 3600
 _request_lock = threading.Lock()
 
 _api_instance = None
@@ -72,22 +72,17 @@ def convert_numpy(obj):
 
 # ========== 滑動窗口請求限制 ==========
 def _wait_for_slot():
-    """等待直到可用請求槽位，然後記錄本次請求時間"""
     global _request_times
     with _request_lock:
         now = time.time()
-        # 清除超過 1 小時的舊記錄
         while _request_times and now - _request_times[0] > REQUEST_WINDOW:
             _request_times.popleft()
-        # 如果已達上限，計算需等待的時間
         if len(_request_times) >= REQUEST_LIMIT:
             oldest = _request_times[0]
-            wait_sec = oldest + REQUEST_WINDOW - now + 1   # 多等 1 秒
+            wait_sec = oldest + REQUEST_WINDOW - now + 1
             print(f"⏳ 請求已達 {REQUEST_LIMIT} 次，暫停 {int(wait_sec)} 秒")
             time.sleep(wait_sec)
-            # 重新整理（遞迴呼叫，但最多一次）
             return _wait_for_slot()
-        # 記錄本次請求時間
         _request_times.append(time.time())
 
 # 股票清單快取
@@ -110,18 +105,22 @@ def get_filtered_stock_ids():
     return ids
 
 def fetch_daily(sid, start_date, end_date):
-    """下載單一股票歷史日線，自動限流"""
+    """下載單一股票歷史日線，增強錯誤記錄"""
     _wait_for_slot()
     api = get_api()
     try:
         data = api.taiwan_stock_daily(stock_id=sid, start_date=start_date, end_date=end_date)
         if data is None or data.empty:
+            print(f"  {sid} 回傳空資料")
             return None
         data["date"] = pd.to_datetime(data["date"])
         data.sort_values("date", inplace=True)
         data.set_index("date", inplace=True)
         return data
     except Exception as e:
+        # 嘗試取出 HTTP 狀態碼等資訊
+        error_msg = str(e)
+        print(f"  {sid} 下載失敗：{error_msg}")
         return None
 
 def _get_col(data, *names):
@@ -138,6 +137,7 @@ def minervini_check(data):
     high  = _get_col(data, "max", "high", "High")
     if close is None or high is None:
         return False
+    # 只丟棄 NaN，不再強制 >0
     close = pd.to_numeric(close, errors='coerce').dropna()
     high  = pd.to_numeric(high,  errors='coerce').dropna()
     if len(close) < 200 or len(high) < 200:
@@ -170,9 +170,8 @@ def vcp_math_check(data):
     close  = pd.to_numeric(close, errors='coerce')
     volume = pd.to_numeric(volume, errors='coerce')
 
+    # 放寬清洗：只丟棄 NaN，保留 0 值
     df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
-    df_clean = df_clean[(df_clean["close"] > 0) & (df_clean["volume"] > 0)]
-
     if len(df_clean) < 60:
         return None
 
@@ -249,13 +248,13 @@ def build_report(total, results):
         return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
     msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
-    for i, c in enumerate(sorted_results[:30], 1):
+    for i, c in enumerate(sorted_results[:15], 1):
         symbol = c['symbol']
         yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== 掃描執行器（防止重入） ==========
+# ========== 掃描執行器 ==========
 def _run_scan(scanner_func):
     global any_scan_running
     with scan_lock:
@@ -294,7 +293,6 @@ def manual_scanner():
         _manual_scan_status["done"] = idx
         if idx % 100 == 0:
             print(f"📊 進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(_manual_scan_status['results'])}")
-        # 基礎間隔 8 秒，但 _wait_for_slot 已確保不超量
         time.sleep(8.0)
     _manual_scan_status["running"] = False
     with scan_lock:
@@ -322,14 +320,11 @@ def background_scanner():
         time.sleep(8.0)
     with scan_lock:
         scan_results = local_results
-    # 同步到手動掃描狀態，讓前端可以查詢
     _manual_scan_status["running"] = False
     _manual_scan_status["total"] = total
     _manual_scan_status["done"] = total
     _manual_scan_status["results"] = local_results
-
     last_report_msg = build_report(total, scan_results)
-    # 不自動發送 Telegram，由排程統一發送
     print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
 # ========== API 端點 ==========
@@ -337,7 +332,7 @@ def background_scanner():
 def start_scan_async():
     global any_scan_running
     if any_scan_running:
-        return {"status": "already running (manual or night scan)"}
+        return {"status": "already running"}
     thread = threading.Thread(target=_run_scan, args=(manual_scanner,))
     thread.start()
     return {"status": "started"}
@@ -353,7 +348,6 @@ def start_scan():
 
 @app.get("/scan_status")
 def scan_status():
-    # 如果手動掃描正在進行，回傳即時進度
     if _manual_scan_status["running"]:
         return {
             "running": True,
@@ -361,7 +355,6 @@ def scan_status():
             "done": _manual_scan_status["done"],
             "candidates": []
         }
-    # 如果手動掃描有結果，回傳手動結果
     if _manual_scan_status["results"]:
         return {
             "running": False,
@@ -369,7 +362,6 @@ def scan_status():
             "done": _manual_scan_status["done"],
             "candidates": _manual_scan_status["results"]
         }
-    # 否則回傳夜間掃描結果（若有的話）
     with scan_lock:
         if scan_results:
             return {
@@ -378,26 +370,18 @@ def scan_status():
                 "done": len(scan_results),
                 "candidates": scan_results
             }
-    # 完全沒有任何結果
-    return {
-        "running": False,
-        "total": 0,
-        "done": 0,
-        "candidates": []
-    }
+    return {"running": False, "total": 0, "done": 0, "candidates": []}
 
 @app.get("/send_report")
 def send_report():
     global scan_results, last_report_msg
     total = len(get_filtered_stock_ids())
-    # 如果手動掃描有結果，優先使用
     if _manual_scan_status["results"]:
         msg = build_report(total, _manual_scan_status["results"])
     else:
         msg = build_report(total, scan_results)
     last_report_msg = msg
     send_telegram_msg(msg)
-    # 不再清空 scan_results，保留給前端查詢
     return {"status": "report sent"}
 
 @app.get("/latest_report")
