@@ -2,6 +2,7 @@ import os
 import time
 import threading
 from datetime import datetime, timedelta
+from collections import deque
 
 import pandas as pd
 import numpy as np
@@ -30,10 +31,13 @@ any_scan_running = False
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
 
-# 嚴格的請求間隔控制
-REQUEST_INTERVAL_SEC = 8.5          # 每檔股票最少間隔 8.5 秒
+# 請求頻率控制 ── 滑動窗口 (每小時 500 次) + 最小間隔 7 秒
+_request_times = deque()
+REQUEST_LIMIT = 500
+REQUEST_WINDOW = 3600
+MIN_INTERVAL = 7.0          # 強制每次請求至少間隔 7 秒
 _last_request_time = 0
-_request_time_lock = threading.Lock()
+_request_lock = threading.Lock()
 
 _api_instance = None
 def get_api():
@@ -68,44 +72,36 @@ def convert_numpy(obj):
         return obj.tolist()
     return obj
 
-# ========== 強制請求間隔 ==========
-def _wait_interval():
-    global _last_request_time
-    with _request_time_lock:
+# ========== 強制平滑限流 ==========
+def _wait_for_slot():
+    global _request_times, _last_request_time
+    with _request_lock:
+        # 1. 確保與上一次請求至少間隔 MIN_INTERVAL 秒
         now = time.time()
-        elapsed = now - _last_request_time
-        if elapsed < REQUEST_INTERVAL_SEC:
-            sleep_sec = REQUEST_INTERVAL_SEC - elapsed
+        since_last = now - _last_request_time
+        if since_last < MIN_INTERVAL:
+            sleep_sec = MIN_INTERVAL - since_last
             time.sleep(sleep_sec)
+            now = time.time()   # 更新現在時間
+
+        # 2. 清除超過 1 小時的舊記錄
+        while _request_times and now - _request_times[0] > REQUEST_WINDOW:
+            _request_times.popleft()
+
+        # 3. 若已達每小時上限，等待到最舊一筆過期
+        if len(_request_times) >= REQUEST_LIMIT:
+            oldest = _request_times[0]
+            wait_sec = oldest + REQUEST_WINDOW - now + 1
+            print(f"⏳ 請求已達 {REQUEST_LIMIT} 次，暫停 {int(wait_sec)} 秒")
+            time.sleep(wait_sec)
+            # 重新檢查
+            return _wait_for_slot()
+
+        # 4. 記錄本次請求時間
+        _request_times.append(time.time())
         _last_request_time = time.time()
 
-# ========== FinMind 剩餘用量查詢 ==========
-def get_finmind_quota():
-    """查詢當前 token 的剩餘用量，回傳 dict 或 None"""
-    try:
-        url = "https://api.finmindtrade.com/api/v4/user_info"
-        resp = requests.get(url, params={"token": FINMIND_TOKEN}, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "remaining" in data:
-                return data
-    except:
-        pass
-    return None
-
-def wait_for_quota():
-    """如果剩餘用量低於 10，則暫停到下一個整點"""
-    while True:
-        quota = get_finmind_quota()
-        if quota and quota.get("remaining", 999) >= 10:
-            break
-        now = datetime.now()
-        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        wait_sec = (next_hour - now).total_seconds()
-        print(f"⏳ FinMind 額度不足，暫停 {int(wait_sec)} 秒至 {next_hour.strftime('%H:%M')}")
-        time.sleep(wait_sec)
-
-# ========== 股票清單 ==========
+# 股票清單快取 (含重試機制)
 _stock_ids_cache = {"ids": [], "ts": 0}
 def get_filtered_stock_ids():
     now = time.time()
@@ -115,8 +111,7 @@ def get_filtered_stock_ids():
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            _wait_interval()
-            wait_for_quota()
+            _wait_for_slot()
             api = get_api()
             info = api.taiwan_stock_info()
             if info is None or info.empty:
@@ -133,12 +128,12 @@ def get_filtered_stock_ids():
             if attempt < max_retries - 1:
                 time.sleep(5)
             else:
+                print("🚨 無法取得股票清單，掃描終止")
                 return []
 
 def fetch_daily(sid, start_date, end_date):
-    """下載單一股票歷史日線，嚴格限速並檢查額度"""
-    _wait_interval()
-    wait_for_quota()
+    """下載單一股票歷史日線，強制平滑限流"""
+    _wait_for_slot()        # 這裡會強制間隔 7 秒 + 總量控制
     api = get_api()
     try:
         data = api.taiwan_stock_daily(stock_id=sid, start_date=start_date, end_date=end_date)
@@ -159,7 +154,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini ==========
+# ========== 第一層：Minervini（放寬版） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -186,7 +181,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP ==========
+# ========== 第二層：VCP（收緊版） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -213,7 +208,6 @@ def vcp_math_check(data):
             return None
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
 
-        # 計算收縮次數
         contractions = 0
         in_pullback = False
         for i in range(5, len(close)):
@@ -230,7 +224,6 @@ def vcp_math_check(data):
 
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
 
-        # RS 計算
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
         if past_close <= 0:
@@ -238,7 +231,6 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # 過濾條件
         if rs < 60:
             return None
 
@@ -282,7 +274,7 @@ def build_report(total, results):
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== 掃描控制 ==========
+# ========== 掃描執行器 ==========
 def _run_scan(scanner_func):
     global any_scan_running
     with scan_lock:
@@ -327,12 +319,13 @@ def manual_scanner():
         _manual_scan_status["done"] = idx
         if idx % 100 == 0:
             print(f"📊 進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(_manual_scan_status['results'])}")
+        # 不再需要 time.sleep(8.0)，因為 _wait_for_slot 已經強制間隔
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
     print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
-# ========== 夜間掃描 ==========
+# ========== 夜間背景掃描 ==========
 def background_scanner():
     global scan_results, last_report_msg, _manual_scan_status
     stocks = get_filtered_stock_ids()
@@ -426,14 +419,13 @@ def latest_report():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "scanning": any_scan_running}
+    with _request_lock:
+        pending = len(_request_times)
+    return {"status": "ok", "scanning": any_scan_running, "requests_last_hour": pending}
 
-@app.get("/quota")
-def quota():
-    quota = get_finmind_quota()
-    if quota:
-        return quota
-    return {"error": "unable to fetch quota"}
+@app.get("/debug_scan")
+def debug_scan(symbol: str = "3008"):
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
