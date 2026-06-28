@@ -249,7 +249,7 @@ def build_report(total, results):
         return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
     msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
-    for i, c in enumerate(sorted_results[:15], 1):
+    for i, c in enumerate(sorted_results[:30], 1):
         symbol = c['symbol']
         yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
