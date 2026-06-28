@@ -85,24 +85,35 @@ def _wait_for_slot():
             return _wait_for_slot()
         _request_times.append(time.time())
 
-# 股票清單快取
+# 股票清單快取 (含重試機制)
 _stock_ids_cache = {"ids": [], "ts": 0}
 def get_filtered_stock_ids():
     now = time.time()
     if _stock_ids_cache["ids"] and (now - _stock_ids_cache["ts"]) < 86400:
         return _stock_ids_cache["ids"]
-    _wait_for_slot()
-    api = get_api()
-    info = api.taiwan_stock_info()
-    if info is None or info.empty:
-        return []
-    info = info[~info["stock_name"].str.contains("權|ETF|存託憑證", na=False)]
-    info = info[info["stock_id"].str.len() == 4]
-    ids = info["stock_id"].unique().tolist()
-    _stock_ids_cache["ids"] = ids
-    _stock_ids_cache["ts"] = now
-    print(f"📋 普通股代號數量：{len(ids)}")
-    return ids
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            _wait_for_slot()
+            api = get_api()
+            info = api.taiwan_stock_info()
+            if info is None or info.empty:
+                raise ValueError("回傳空資料")
+            info = info[~info["stock_name"].str.contains("權|ETF|存託憑證", na=False)]
+            info = info[info["stock_id"].str.len() == 4]
+            ids = info["stock_id"].unique().tolist()
+            _stock_ids_cache["ids"] = ids
+            _stock_ids_cache["ts"] = now
+            print(f"📋 普通股代號數量：{len(ids)}")
+            return ids
+        except Exception as e:
+            print(f"❌ 取得股票清單失敗 (嘗試 {attempt+1}/{max_retries})：{e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+            else:
+                print("🚨 無法取得股票清單，掃描終止")
+                return []  # 回傳空列表，後續掃描會安全跳過
 
 def fetch_daily(sid, start_date, end_date):
     """下載單一股票歷史日線，增強錯誤記錄"""
@@ -118,9 +129,7 @@ def fetch_daily(sid, start_date, end_date):
         data.set_index("date", inplace=True)
         return data
     except Exception as e:
-        # 嘗試取出 HTTP 狀態碼等資訊
-        error_msg = str(e)
-        print(f"  {sid} 下載失敗：{error_msg}")
+        print(f"  {sid} 下載失敗：{str(e)[:100]}")
         return None
 
 def _get_col(data, *names):
@@ -137,7 +146,6 @@ def minervini_check(data):
     high  = _get_col(data, "max", "high", "High")
     if close is None or high is None:
         return False
-    # 只丟棄 NaN，不再強制 >0
     close = pd.to_numeric(close, errors='coerce').dropna()
     high  = pd.to_numeric(high,  errors='coerce').dropna()
     if len(close) < 200 or len(high) < 200:
@@ -170,7 +178,6 @@ def vcp_math_check(data):
     close  = pd.to_numeric(close, errors='coerce')
     volume = pd.to_numeric(volume, errors='coerce')
 
-    # 放寬清洗：只丟棄 NaN，保留 0 值
     df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
     if len(df_clean) < 60:
         return None
@@ -254,7 +261,7 @@ def build_report(total, results):
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== 掃描執行器 ==========
+# ========== 掃描執行器（防止重入） ==========
 def _run_scan(scanner_func):
     global any_scan_running
     with scan_lock:
@@ -264,6 +271,8 @@ def _run_scan(scanner_func):
         any_scan_running = True
     try:
         scanner_func()
+    except Exception as e:
+        print(f"💥 掃描線程崩潰：{e}")
     finally:
         with scan_lock:
             any_scan_running = False
@@ -277,6 +286,10 @@ def manual_scanner():
     _manual_scan_status["done"] = 0
     _manual_scan_status["results"] = []
     stocks = get_filtered_stock_ids()
+    if not stocks:
+        _manual_scan_status["running"] = False
+        print("❌ 無股票清單，掃描終止")
+        return
     total = len(stocks)
     _manual_scan_status["total"] = total
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
@@ -303,6 +316,9 @@ def manual_scanner():
 def background_scanner():
     global scan_results, last_report_msg, _manual_scan_status
     stocks = get_filtered_stock_ids()
+    if not stocks:
+        print("❌ 無股票清單，夜間掃描終止")
+        return
     total = len(stocks)
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     end_date = datetime.today().strftime("%Y-%m-%d")
@@ -397,7 +413,6 @@ def health():
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    # 簡易診斷，可自行替換完整版
     return {"status": "ok"}
 
 if __name__ == "__main__":
