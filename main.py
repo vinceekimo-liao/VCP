@@ -35,8 +35,7 @@ last_report_msg = "尚無報告"
 _request_times = deque()
 REQUEST_LIMIT = 500
 REQUEST_WINDOW = 3600
-MIN_INTERVAL = 7.0          # 強制每次請求至少間隔 7 秒
-_last_request_time = 0
+MIN_INTERVAL = 7.0          # 每次請求至少間隔 7 秒
 _request_lock = threading.Lock()
 
 _api_instance = None
@@ -72,36 +71,33 @@ def convert_numpy(obj):
         return obj.tolist()
     return obj
 
-# ========== 強制平滑限流 ==========
+# ========== 無死鎖限流 ==========
 def _wait_for_slot():
-    global _request_times, _last_request_time
-    with _request_lock:
-        # 1. 確保與上一次請求至少間隔 MIN_INTERVAL 秒
-        now = time.time()
-        since_last = now - _last_request_time
-        if since_last < MIN_INTERVAL:
-            sleep_sec = MIN_INTERVAL - since_last
-            time.sleep(sleep_sec)
-            now = time.time()   # 更新現在時間
+    """等待直到可以發送請求（容量與最小間隔皆滿足）"""
+    while True:
+        with _request_lock:
+            now = time.time()
+            # 1. 清除超過 1 小時的舊記錄
+            while _request_times and now - _request_times[0] > REQUEST_WINDOW:
+                _request_times.popleft()
+            
+            # 2. 檢查容量
+            if len(_request_times) < REQUEST_LIMIT:
+                # 3. 檢查最小間隔
+                if not _request_times or (now - _request_times[-1] >= MIN_INTERVAL):
+                    _request_times.append(now)
+                    return   # 成功取得槽位，離開
+                else:
+                    # 間隔不足，計算需等待的時間
+                    wait = MIN_INTERVAL - (now - _request_times[-1])
+            else:
+                # 容量已滿，計算需等待到最舊記錄過期
+                oldest = _request_times[0]
+                wait = oldest + REQUEST_WINDOW - now + 0.1  # 多等 0.1 秒
+        # 釋放鎖並等待
+        time.sleep(wait)
 
-        # 2. 清除超過 1 小時的舊記錄
-        while _request_times and now - _request_times[0] > REQUEST_WINDOW:
-            _request_times.popleft()
-
-        # 3. 若已達每小時上限，等待到最舊一筆過期
-        if len(_request_times) >= REQUEST_LIMIT:
-            oldest = _request_times[0]
-            wait_sec = oldest + REQUEST_WINDOW - now + 1
-            print(f"⏳ 請求已達 {REQUEST_LIMIT} 次，暫停 {int(wait_sec)} 秒")
-            time.sleep(wait_sec)
-            # 重新檢查
-            return _wait_for_slot()
-
-        # 4. 記錄本次請求時間
-        _request_times.append(time.time())
-        _last_request_time = time.time()
-
-# 股票清單快取 (含重試機制)
+# 股票清單快取 (含重試)
 _stock_ids_cache = {"ids": [], "ts": 0}
 def get_filtered_stock_ids():
     now = time.time()
@@ -132,8 +128,8 @@ def get_filtered_stock_ids():
                 return []
 
 def fetch_daily(sid, start_date, end_date):
-    """下載單一股票歷史日線，強制平滑限流"""
-    _wait_for_slot()        # 這裡會強制間隔 7 秒 + 總量控制
+    """下載單一股票歷史日線，自動限流"""
+    _wait_for_slot()
     api = get_api()
     try:
         data = api.taiwan_stock_daily(stock_id=sid, start_date=start_date, end_date=end_date)
@@ -319,7 +315,6 @@ def manual_scanner():
         _manual_scan_status["done"] = idx
         if idx % 100 == 0:
             print(f"📊 進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(_manual_scan_status['results'])}")
-        # 不再需要 time.sleep(8.0)，因為 _wait_for_slot 已經強制間隔
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
