@@ -303,7 +303,7 @@ def manual_scanner():
 
 # ========== 夜間背景掃描 ==========
 def background_scanner():
-    global scan_results, last_report_msg
+    global scan_results, last_report_msg, _manual_scan_status
     stocks = get_filtered_stock_ids()
     total = len(stocks)
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
@@ -322,8 +322,14 @@ def background_scanner():
         time.sleep(8.0)
     with scan_lock:
         scan_results = local_results
+    # 同步到手動掃描狀態，讓前端可以查詢
+    _manual_scan_status["running"] = False
+    _manual_scan_status["total"] = total
+    _manual_scan_status["done"] = total
+    _manual_scan_status["results"] = local_results
+
     last_report_msg = build_report(total, scan_results)
-    send_telegram_msg(last_report_msg)
+    # 不自動發送 Telegram，由排程統一發送
     print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
 # ========== API 端點 ==========
@@ -347,21 +353,51 @@ def start_scan():
 
 @app.get("/scan_status")
 def scan_status():
+    # 如果手動掃描正在進行，回傳即時進度
+    if _manual_scan_status["running"]:
+        return {
+            "running": True,
+            "total": _manual_scan_status["total"],
+            "done": _manual_scan_status["done"],
+            "candidates": []
+        }
+    # 如果手動掃描有結果，回傳手動結果
+    if _manual_scan_status["results"]:
+        return {
+            "running": False,
+            "total": _manual_scan_status["total"],
+            "done": _manual_scan_status["done"],
+            "candidates": _manual_scan_status["results"]
+        }
+    # 否則回傳夜間掃描結果（若有的話）
+    with scan_lock:
+        if scan_results:
+            return {
+                "running": False,
+                "total": len(get_filtered_stock_ids()),
+                "done": len(scan_results),
+                "candidates": scan_results
+            }
+    # 完全沒有任何結果
     return {
-        "running": _manual_scan_status["running"],
-        "total": _manual_scan_status["total"],
-        "done": _manual_scan_status["done"],
-        "candidates": _manual_scan_status["results"] if not _manual_scan_status["running"] else []
+        "running": False,
+        "total": 0,
+        "done": 0,
+        "candidates": []
     }
 
 @app.get("/send_report")
 def send_report():
     global scan_results, last_report_msg
     total = len(get_filtered_stock_ids())
-    msg = build_report(total, scan_results)
+    # 如果手動掃描有結果，優先使用
+    if _manual_scan_status["results"]:
+        msg = build_report(total, _manual_scan_status["results"])
+    else:
+        msg = build_report(total, scan_results)
     last_report_msg = msg
     send_telegram_msg(msg)
-    scan_results.clear()
+    # 不再清空 scan_results，保留給前端查詢
     return {"status": "report sent"}
 
 @app.get("/latest_report")
