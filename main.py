@@ -227,22 +227,24 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        if rs < 60:
+        # ── 進一步收緊的過濾條件 ──
+        if rs < 70:                     # 提高 RS 門檻
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.0)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.3)
-        cond3 = (today_change > 2.0) and (vol_ratio > 1.3)
-        cond4 = (contractions >= 5) and (vol_ratio >= 0.8) and (rs >= 92)
-        cond5 = (contractions >= 3) and (vol_ratio >= 0.9) and (rs >= 95)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.1)                     # 收縮 + 量能提升
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.4)                    # 更嚴格的帶量收縮
+        cond3 = (today_change > 2.5) and (vol_ratio > 1.5)                   # 更強的突破
+        cond4 = (contractions >= 6) and (vol_ratio >= 0.8) and (rs >= 95)    # 高收縮 + 極高 RS
+        cond5 = (contractions >= 4) and (vol_ratio >= 0.9) and (rs >= 97)    # 中收縮 + 極高 RS
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
+        # 品質評分（略作調整）
         qs = 0
-        if contractions >= 2: qs += 1
-        if vol_ratio >= 1.2: qs += 1
-        if rs >= 80: qs += 1
+        if contractions >= 3: qs += 1
+        if vol_ratio >= 1.3: qs += 1
+        if rs >= 85: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
         return {
