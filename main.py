@@ -422,7 +422,25 @@ def health():
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    return {"status": "ok"}
+    result = {"symbol": symbol, "step1_fetch": None, "step2_minervini": None, "step3_vcp": None}
+    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+    end_date = datetime.today().strftime("%Y-%m-%d")
+    df = fetch_daily(symbol, start_date, end_date)
+    if df is None:
+        result["step1_fetch"] = "下載失敗"
+        return convert_numpy(result)
+    result["step1_fetch"] = {
+        "rows": len(df),
+        "columns": df.columns.tolist(),
+        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無",
+        "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "無",
+    }
+    result["step2_minervini"] = minervini_check_with_debug(df)
+    if result["step2_minervini"].get("passed"):
+        result["step3_vcp"] = vcp_math_check_with_debug(df)
+    else:
+        result["step3_vcp"] = "未執行（Minervini 未通過）"
+    return convert_numpy(result)
 
 if __name__ == "__main__":
     import uvicorn
