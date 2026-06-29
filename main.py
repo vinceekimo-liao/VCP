@@ -140,7 +140,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（放寬版） ==========
+# ========== 第一層：Minervini（進一步收緊） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -153,21 +153,23 @@ def minervini_check(data):
     if len(close) < 200 or len(high) < 200:
         return False
     try:
+        ma50  = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
-        cond_ma = (last > ma150.iloc[-1]) or (last > ma200.iloc[-1])
-        if not cond_ma:
+        # 收緊：必須同時大於 MA150 且 MA200
+        if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
+        # 距 52 週高點放寬至 75%（即必須在 25% 以內）
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
-            if pd.notna(high_52w) and last < high_52w * 0.65:
+            if pd.notna(high_52w) and last < high_52w * 0.75:
                 return False
         return True
     except:
         return False
 
-# ========== 第二層：VCP（收緊版） ==========
+# ========== 第二層：VCP（再次收緊） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -218,18 +220,19 @@ def vcp_math_check(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
         # ── 進一步收緊的過濾條件 ──
-        if rs < 70:
+        if rs < 75:                     # 提高 RS 門檻
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.1)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.4)
-        cond3 = (today_change > 2.5) and (vol_ratio > 1.5)
-        cond4 = (contractions >= 6) and (vol_ratio >= 0.8) and (rs >= 95)
-        cond5 = (contractions >= 4) and (vol_ratio >= 0.9) and (rs >= 97)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.2)                     # 收縮 + 量能提升
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.5)                    # 更嚴格的帶量收縮
+        cond3 = (today_change > 3.0) and (vol_ratio > 1.6)                   # 更強的突破
+        cond4 = (contractions >= 7) and (vol_ratio >= 0.8) and (rs >= 96)    # 高收縮 + 極高 RS
+        cond5 = (contractions >= 5) and (vol_ratio >= 0.9) and (rs >= 98)    # 中收縮 + 極高 RS
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
+        # 品質評分（略作調整）
         qs = 0
         if contractions >= 3: qs += 1
         if vol_ratio >= 1.3: qs += 1
@@ -249,7 +252,7 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數（完整恢復） ==========
+# ========== 除錯版函數（保持與正式版一致的條件） ==========
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
@@ -273,18 +276,18 @@ def minervini_check_with_debug(data):
         debug["last"] = round(last, 2)
         debug["ma150"] = round(ma150.iloc[-1], 2) if not pd.isna(ma150.iloc[-1]) else "NaN"
         debug["ma200"] = round(ma200.iloc[-1], 2) if not pd.isna(ma200.iloc[-1]) else "NaN"
-        cond_ma = (last > ma150.iloc[-1]) or (last > ma200.iloc[-1])
+        cond_ma = (last > ma150.iloc[-1]) and (last > ma200.iloc[-1])
         debug["cond_ma"] = cond_ma
         if not cond_ma:
-            debug["reason"] = "收盤價未大於 MA150 或 MA200"
+            debug["reason"] = "收盤價未同時大於 MA150 且 MA200"
             return debug
         if len(high_clean) >= 200:
             high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
             debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
             if pd.notna(high_52w):
-                debug["high_52w_65pct"] = round(high_52w * 0.65, 2)
-                if last < high_52w * 0.65:
-                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.65,2)}"
+                debug["high_52w_75pct"] = round(high_52w * 0.75, 2)
+                if last < high_52w * 0.75:
+                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.75,2)}"
                     return debug
         debug["passed"] = True
         return debug
@@ -347,15 +350,15 @@ def vcp_math_check_with_debug(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
         debug["rs"] = rs
 
-        if rs < 70:
-            debug["reason"] = f"RS < 70 (實際 {rs})"
+        if rs < 75:
+            debug["reason"] = f"RS < 75 (實際 {rs})"
             return debug
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.1)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.4)
-        cond3 = (today_change > 2.5) and (vol_ratio > 1.5)
-        cond4 = (contractions >= 6) and (vol_ratio >= 0.8) and (rs >= 95)
-        cond5 = (contractions >= 4) and (vol_ratio >= 0.9) and (rs >= 97)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.2)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.5)
+        cond3 = (today_change > 3.0) and (vol_ratio > 1.6)
+        cond4 = (contractions >= 7) and (vol_ratio >= 0.8) and (rs >= 96)
+        cond5 = (contractions >= 5) and (vol_ratio >= 0.9) and (rs >= 98)
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
