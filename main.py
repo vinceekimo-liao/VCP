@@ -140,7 +140,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（進一步收緊） ==========
+# ========== 第一層：Minervini（再次收緊） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -153,17 +153,16 @@ def minervini_check(data):
     if len(close) < 200 or len(high) < 200:
         return False
     try:
-        ma50  = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
         # 收緊：必須同時大於 MA150 且 MA200
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-        # 距 52 週高點放寬至 75%（即必須在 25% 以內）
+        # 距 52 週高點收緊至 80%（即股價必須在 52 週高點的 80% 以內）
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
-            if pd.notna(high_52w) and last < high_52w * 0.75:
+            if pd.notna(high_52w) and last < high_52w * 0.80:
                 return False
         return True
     except:
@@ -220,14 +219,14 @@ def vcp_math_check(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
         # ── 進一步收緊的過濾條件 ──
-        if rs < 75:                     # 提高 RS 門檻
+        if rs < 80:                     # 提高 RS 門檻
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.2)                     # 收縮 + 量能提升
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.5)                    # 更嚴格的帶量收縮
-        cond3 = (today_change > 3.0) and (vol_ratio > 1.6)                   # 更強的突破
-        cond4 = (contractions >= 7) and (vol_ratio >= 0.8) and (rs >= 96)    # 高收縮 + 極高 RS
-        cond5 = (contractions >= 5) and (vol_ratio >= 0.9) and (rs >= 98)    # 中收縮 + 極高 RS
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.3)                     # 收縮 + 量能提升
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.6)                    # 更嚴格的帶量收縮
+        cond3 = (today_change > 3.5) and (vol_ratio > 1.8)                   # 更強的突破
+        cond4 = (contractions >= 8) and (vol_ratio >= 0.8) and (rs >= 97)    # 高收縮 + 極高 RS
+        cond5 = (contractions >= 6) and (vol_ratio >= 0.9) and (rs >= 99)    # 中收縮 + 極高 RS
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
@@ -235,8 +234,8 @@ def vcp_math_check(data):
         # 品質評分（略作調整）
         qs = 0
         if contractions >= 3: qs += 1
-        if vol_ratio >= 1.3: qs += 1
-        if rs >= 85: qs += 1
+        if vol_ratio >= 1.4: qs += 1
+        if rs >= 88: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
         return {
@@ -269,7 +268,6 @@ def minervini_check_with_debug(data):
         debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high/max {len(high_clean)}"
         return debug
     try:
-        ma50  = close_clean.rolling(50).mean()
         ma150 = close_clean.rolling(150).mean()
         ma200 = close_clean.rolling(200).mean()
         last  = close_clean.iloc[-1]
@@ -285,9 +283,9 @@ def minervini_check_with_debug(data):
             high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
             debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
             if pd.notna(high_52w):
-                debug["high_52w_75pct"] = round(high_52w * 0.75, 2)
-                if last < high_52w * 0.75:
-                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.75,2)}"
+                debug["high_52w_80pct"] = round(high_52w * 0.80, 2)
+                if last < high_52w * 0.80:
+                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.80,2)}"
                     return debug
         debug["passed"] = True
         return debug
@@ -350,15 +348,15 @@ def vcp_math_check_with_debug(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
         debug["rs"] = rs
 
-        if rs < 75:
-            debug["reason"] = f"RS < 75 (實際 {rs})"
+        if rs < 80:
+            debug["reason"] = f"RS < 80 (實際 {rs})"
             return debug
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.2)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.5)
-        cond3 = (today_change > 3.0) and (vol_ratio > 1.6)
-        cond4 = (contractions >= 7) and (vol_ratio >= 0.8) and (rs >= 96)
-        cond5 = (contractions >= 5) and (vol_ratio >= 0.9) and (rs >= 98)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.3)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.6)
+        cond3 = (today_change > 3.5) and (vol_ratio > 1.8)
+        cond4 = (contractions >= 8) and (vol_ratio >= 0.8) and (rs >= 97)
+        cond5 = (contractions >= 6) and (vol_ratio >= 0.9) and (rs >= 99)
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
