@@ -140,7 +140,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（再次收緊） ==========
+# ========== 第一層：Minervini（進一步收緊） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -156,13 +156,12 @@ def minervini_check(data):
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
-        # 收緊：必須同時大於 MA150 且 MA200
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-        # 距 52 週高點收緊至 80%（即股價必須在 52 週高點的 80% 以內）
+        # 距 52 週高點收緊至 85%
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
-            if pd.notna(high_52w) and last < high_52w * 0.80:
+            if pd.notna(high_52w) and last < high_52w * 0.85:
                 return False
         return True
     except:
@@ -219,22 +218,21 @@ def vcp_math_check(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
         # ── 進一步收緊的過濾條件 ──
-        if rs < 80:                     # 提高 RS 門檻
+        if rs < 82:
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.3)                     # 收縮 + 量能提升
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.6)                    # 更嚴格的帶量收縮
-        cond3 = (today_change > 3.5) and (vol_ratio > 1.8)                   # 更強的突破
-        cond4 = (contractions >= 8) and (vol_ratio >= 0.8) and (rs >= 97)    # 高收縮 + 極高 RS
-        cond5 = (contractions >= 6) and (vol_ratio >= 0.9) and (rs >= 99)    # 中收縮 + 極高 RS
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.4)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.7)
+        cond3 = (today_change > 4.0) and (vol_ratio > 2.0)
+        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 98)
+        cond5 = (contractions >= 7) and (vol_ratio >= 1.0) and (rs >= 99)
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
-        # 品質評分（略作調整）
         qs = 0
         if contractions >= 3: qs += 1
-        if vol_ratio >= 1.4: qs += 1
+        if vol_ratio >= 1.5: qs += 1
         if rs >= 88: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
@@ -251,7 +249,7 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數（保持與正式版一致的條件） ==========
+# 除錯版函數（保持與正式版一致）
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
@@ -283,9 +281,9 @@ def minervini_check_with_debug(data):
             high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
             debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
             if pd.notna(high_52w):
-                debug["high_52w_80pct"] = round(high_52w * 0.80, 2)
-                if last < high_52w * 0.80:
-                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.80,2)}"
+                debug["high_52w_85pct"] = round(high_52w * 0.85, 2)
+                if last < high_52w * 0.85:
+                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.85,2)}"
                     return debug
         debug["passed"] = True
         return debug
@@ -348,15 +346,15 @@ def vcp_math_check_with_debug(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
         debug["rs"] = rs
 
-        if rs < 80:
-            debug["reason"] = f"RS < 80 (實際 {rs})"
+        if rs < 82:
+            debug["reason"] = f"RS < 82 (實際 {rs})"
             return debug
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.3)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.6)
-        cond3 = (today_change > 3.5) and (vol_ratio > 1.8)
-        cond4 = (contractions >= 8) and (vol_ratio >= 0.8) and (rs >= 97)
-        cond5 = (contractions >= 6) and (vol_ratio >= 0.9) and (rs >= 99)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.4)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.7)
+        cond3 = (today_change > 4.0) and (vol_ratio > 2.0)
+        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 98)
+        cond5 = (contractions >= 7) and (vol_ratio >= 1.0) and (rs >= 99)
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
@@ -481,29 +479,32 @@ def start_scan():
 
 @app.get("/scan_status")
 def scan_status():
-    if _manual_scan_status["running"]:
-        return {
-            "running": True,
-            "total": _manual_scan_status["total"],
-            "done": _manual_scan_status["done"],
-            "candidates": []
-        }
-    if _manual_scan_status["results"]:
-        return {
-            "running": False,
-            "total": _manual_scan_status["total"],
-            "done": _manual_scan_status["done"],
-            "candidates": _manual_scan_status["results"]
-        }
-    with scan_lock:
-        if scan_results:
-            return {
+    try:
+        if _manual_scan_status["running"]:
+            return convert_numpy({
+                "running": True,
+                "total": _manual_scan_status["total"],
+                "done": _manual_scan_status["done"],
+                "candidates": []
+            })
+        if _manual_scan_status["results"]:
+            return convert_numpy({
                 "running": False,
-                "total": len(get_filtered_stock_ids()),
-                "done": len(scan_results),
-                "candidates": scan_results
-            }
-    return {"running": False, "total": 0, "done": 0, "candidates": []}
+                "total": _manual_scan_status["total"],
+                "done": _manual_scan_status["done"],
+                "candidates": _manual_scan_status["results"]
+            })
+        with scan_lock:
+            if scan_results:
+                return convert_numpy({
+                    "running": False,
+                    "total": len(get_filtered_stock_ids()),
+                    "done": len(scan_results),
+                    "candidates": scan_results
+                })
+        return {"running": False, "total": 0, "done": 0, "candidates": []}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/send_report")
 def send_report():
