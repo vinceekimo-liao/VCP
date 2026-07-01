@@ -140,7 +140,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（進一步收緊） ==========
+# ========== 第一層：Minervini（再次收緊：距52週高點85%以內） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -156,9 +156,10 @@ def minervini_check(data):
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
+        # 必須同時大於 MA150 且 MA200
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-        # 距 52 週高點收緊至 85%
+        # 距 52 週高點必須在 85% 以內（更接近高點）
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
             if pd.notna(high_52w) and last < high_52w * 0.85:
@@ -167,7 +168,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（再次收緊） ==========
+# ========== 第二層：VCP（再次收緊：RS >= 85，各條件強化） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -217,23 +218,24 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # ── 進一步收緊的過濾條件 ──
-        if rs < 82:
+        # ── 收緊條件 ──
+        if rs < 85:                     # 提高 RS 門檻至 85
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.4)
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.7)
-        cond3 = (today_change > 4.0) and (vol_ratio > 2.0)
-        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 98)
-        cond5 = (contractions >= 7) and (vol_ratio >= 1.0) and (rs >= 99)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.4)                     # 收縮 + 量能提升
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.7)                    # 更嚴格的帶量收縮
+        cond3 = (today_change > 4.0) and (vol_ratio > 2.0)                   # 更強的突破
+        cond4 = (contractions >= 9) and (vol_ratio >= 0.8) and (rs >= 98)    # 高收縮 + 極高 RS
+        cond5 = (contractions >= 7) and (vol_ratio >= 0.9) and (rs >= 99)    # 中收縮 + 極高 RS
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
+        # 品質評分（略作調整）
         qs = 0
         if contractions >= 3: qs += 1
         if vol_ratio >= 1.5: qs += 1
-        if rs >= 88: qs += 1
+        if rs >= 90: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
         return {
@@ -249,7 +251,7 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# 除錯版函數（保持與正式版一致）
+# ========== 除錯版函數（保持與正式版一致的條件） ==========
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
@@ -346,15 +348,15 @@ def vcp_math_check_with_debug(data):
         rs = int(max(1, min(99, round(float(rs_raw)))))
         debug["rs"] = rs
 
-        if rs < 82:
-            debug["reason"] = f"RS < 82 (實際 {rs})"
+        if rs < 85:
+            debug["reason"] = f"RS < 85 (實際 {rs})"
             return debug
 
         cond1 = (contractions >= 2) and (vol_ratio >= 1.4)
         cond2 = (contractions >= 1) and (vol_ratio >= 1.7)
         cond3 = (today_change > 4.0) and (vol_ratio > 2.0)
-        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 98)
-        cond5 = (contractions >= 7) and (vol_ratio >= 1.0) and (rs >= 99)
+        cond4 = (contractions >= 9) and (vol_ratio >= 0.8) and (rs >= 98)
+        cond5 = (contractions >= 7) and (vol_ratio >= 0.9) and (rs >= 99)
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
@@ -481,30 +483,30 @@ def start_scan():
 def scan_status():
     try:
         if _manual_scan_status["running"]:
-            return convert_numpy({
+            return {
                 "running": True,
                 "total": _manual_scan_status["total"],
                 "done": _manual_scan_status["done"],
                 "candidates": []
-            })
+            }
         if _manual_scan_status["results"]:
-            return convert_numpy({
+            return {
                 "running": False,
                 "total": _manual_scan_status["total"],
                 "done": _manual_scan_status["done"],
                 "candidates": _manual_scan_status["results"]
-            })
+            }
         with scan_lock:
             if scan_results:
-                return convert_numpy({
+                return {
                     "running": False,
                     "total": len(get_filtered_stock_ids()),
                     "done": len(scan_results),
                     "candidates": scan_results
-                })
+                }
         return {"running": False, "total": 0, "done": 0, "candidates": []}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []}
 
 @app.get("/send_report")
 def send_report():
@@ -550,6 +552,35 @@ def debug_scan(symbol: str = "3008"):
     else:
         result["step3_vcp"] = "未執行（Minervini 未通過）"
     return convert_numpy(result)
+
+# 新增：完整報告端點（HTML 表格）
+@app.get("/full_report")
+def full_report():
+    # 優先使用手動掃描結果，否則使用夜間掃描結果
+    results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
+    total = len(get_filtered_stock_ids()) if not _manual_scan_status["total"] else _manual_scan_status["total"]
+    if not results:
+        return HTML(content="<html><body><h2>尚無篩選結果</h2></body></html>")
+    sorted_results = sorted(results, key=lambda x: -x["rs_score"])
+    html = f"""<html><head><meta charset='utf-8'><title>VCP 完整報告</title>
+    <style>
+        body {{ background: #060d16; color: #e2f0ff; font-family: sans-serif; padding: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
+        th {{ background: #1a2d40; padding: 6px; text-align: left; }}
+        td {{ padding: 6px; border-bottom: 1px solid #1a2d40; }}
+        a {{ color: #38bdf8; }}
+    </style></head><body>
+    <h2>📈 VCP 完整篩選報告</h2>
+    <p>掃描 {total} 檔，符合 {len(sorted_results)} 檔</p>
+    <table><tr><th>代號</th><th>股價</th><th>漲跌%</th><th>RS</th><th>收縮次數</th><th>量比</th><th>品質</th><th>Yahoo</th></tr>"""
+    for c in sorted_results:
+        html += f"<tr><td>{c['symbol']}</td><td>{c['price']}</td><td>{c['change_pct']:+.2f}%</td><td>{c['rs_score']}</td><td>{c['contractions']}</td><td>{c['volume_ratio']}</td><td>{c['quality']}</td><td><a href='https://tw.stock.yahoo.com/quote/{c['symbol']}' target='_blank'>Yahoo</a></td></tr>"
+    html += "</table></body></html>"
+    return HTML(content=html)
+
+from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Query
+app.get("/full_report", response_class=HTMLResponse)(full_report)
 
 if __name__ == "__main__":
     import uvicorn
