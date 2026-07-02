@@ -9,6 +9,7 @@ import numpy as np
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse  # 添加这一行
 from FinMind.data import DataLoader
 
 app = FastAPI()
@@ -20,18 +21,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========== 環境變數 ==========
+# ========== 环境变量 ==========
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ========== 全域變數 ==========
+# ========== 全局变量 ==========
 scan_results = []
 any_scan_running = False
 scan_lock = threading.Lock()
-last_report_msg = "尚無報告"
+last_report_msg = "尚无报告"
 
-# 請求頻率控制 ── 滑動窗口 (每小時 500 次) + 最小間隔 7 秒
+# 请求频率控制 ── 滑动窗口 (每小时 500 次) + 最小间隔 7 秒
 _request_times = deque()
 REQUEST_LIMIT = 500
 REQUEST_WINDOW = 3600
@@ -48,13 +49,13 @@ def get_api():
 
 def send_telegram_msg(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 缺少 Telegram 設定")
+        print("⚠️ 缺少 Telegram 设定")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
-        print(f"Telegram 發送失敗：{e}")
+        print(f"Telegram 发送失败：{e}")
 
 def convert_numpy(obj):
     if isinstance(obj, dict):
@@ -71,7 +72,7 @@ def convert_numpy(obj):
         return obj.tolist()
     return obj
 
-# ========== 無死鎖限流 ==========
+# ========== 无死锁限流 ==========
 def _wait_for_slot():
     while True:
         with _request_lock:
@@ -89,7 +90,7 @@ def _wait_for_slot():
                 wait = oldest + REQUEST_WINDOW - now + 0.1
         time.sleep(wait)
 
-# 股票清單快取 (含重試)
+# 股票清单缓存 (含重试)
 _stock_ids_cache = {"ids": [], "ts": 0}
 def get_filtered_stock_ids():
     now = time.time()
@@ -102,20 +103,20 @@ def get_filtered_stock_ids():
             api = get_api()
             info = api.taiwan_stock_info()
             if info is None or info.empty:
-                raise ValueError("回傳空資料")
-            info = info[~info["stock_name"].str.contains("權|ETF|存託憑證", na=False)]
+                raise ValueError("回传空资料")
+            info = info[~info["stock_name"].str.contains("权|ETF|存托凭证", na=False)]
             info = info[info["stock_id"].str.len() == 4]
             ids = info["stock_id"].unique().tolist()
             _stock_ids_cache["ids"] = ids
             _stock_ids_cache["ts"] = now
-            print(f"📋 普通股代號數量：{len(ids)}")
+            print(f"📋 普通股代号数量：{len(ids)}")
             return ids
         except Exception as e:
-            print(f"❌ 取得股票清單失敗 (嘗試 {attempt+1}/{max_retries})：{e}")
+            print(f"❌ 取得股票清单失败 (尝试 {attempt+1}/{max_retries})：{e}")
             if attempt < max_retries - 1:
                 time.sleep(5)
             else:
-                print("🚨 無法取得股票清單，掃描終止")
+                print("🚨 无法取得股票清单，扫描终止")
                 return []
 
 def fetch_daily(sid, start_date, end_date):
@@ -124,14 +125,14 @@ def fetch_daily(sid, start_date, end_date):
     try:
         data = api.taiwan_stock_daily(stock_id=sid, start_date=start_date, end_date=end_date)
         if data is None or data.empty:
-            print(f"  {sid} 回傳空資料")
+            print(f"  {sid} 回传空资料")
             return None
         data["date"] = pd.to_datetime(data["date"])
         data.sort_values("date", inplace=True)
         data.set_index("date", inplace=True)
         return data
     except Exception as e:
-        print(f"  {sid} 下載失敗：{str(e)[:100]}")
+        print(f"  {sid} 下载失败：{str(e)[:100]}")
         return None
 
 def _get_col(data, *names):
@@ -140,7 +141,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（再次收緊：距52週高點85%以內） ==========
+# ========== 第一层：Minervini（收紧：距52周高点85%以内） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -156,10 +157,8 @@ def minervini_check(data):
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
-        # 必須同時大於 MA150 且 MA200
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-        # 距 52 週高點必須在 85% 以內（更接近高點）
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
             if pd.notna(high_52w) and last < high_52w * 0.85:
@@ -168,7 +167,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（再次收緊：RS >= 85，各條件強化） ==========
+# ========== 第二层：VCP（再次收紧：RS>=85） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -218,20 +217,19 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # ── 收緊條件 ──
-        if rs < 85:                     # 提高 RS 門檻至 85
+        # ── 收紧条件 ──
+        if rs < 85:
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.4)                     # 收縮 + 量能提升
-        cond2 = (contractions >= 1) and (vol_ratio >= 1.7)                    # 更嚴格的帶量收縮
-        cond3 = (today_change > 4.0) and (vol_ratio > 2.0)                   # 更強的突破
-        cond4 = (contractions >= 9) and (vol_ratio >= 0.8) and (rs >= 98)    # 高收縮 + 極高 RS
-        cond5 = (contractions >= 7) and (vol_ratio >= 0.9) and (rs >= 99)    # 中收縮 + 極高 RS
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.4)
+        cond2 = (contractions >= 1) and (vol_ratio >= 1.7)
+        cond3 = (today_change > 4.0) and (vol_ratio > 2.0)
+        cond4 = (contractions >= 9) and (vol_ratio >= 0.8) and (rs >= 98)
+        cond5 = (contractions >= 7) and (vol_ratio >= 0.9) and (rs >= 99)
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
-        # 品質評分（略作調整）
         qs = 0
         if contractions >= 3: qs += 1
         if vol_ratio >= 1.5: qs += 1
@@ -251,21 +249,21 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數（保持與正式版一致的條件） ==========
+# ========== 除错版函数（保持与正式版一致的条件） ==========
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
-        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
+        debug["reason"] = f"资料笔数不足：{len(data) if data is not None else 'None'}"
         return debug
     close = _get_col(data, "close", "Close")
     high  = _get_col(data, "max", "high", "High")
     if close is None or high is None:
-        debug["reason"] = f"缺少欄位：close={close is not None}, high/max={high is not None}"
+        debug["reason"] = f"缺少栏位：close={close is not None}, high/max={high is not None}"
         return debug
     close_clean = pd.to_numeric(close, errors='coerce').dropna()
     high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
     if len(close_clean) < 200 or len(high_clean) < 200:
-        debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high/max {len(high_clean)}"
+        debug["reason"] = f"去除 NaN 后资料不足：close {len(close_clean)}, high/max {len(high_clean)}"
         return debug
     try:
         ma150 = close_clean.rolling(150).mean()
@@ -277,7 +275,7 @@ def minervini_check_with_debug(data):
         cond_ma = (last > ma150.iloc[-1]) and (last > ma200.iloc[-1])
         debug["cond_ma"] = cond_ma
         if not cond_ma:
-            debug["reason"] = "收盤價未同時大於 MA150 且 MA200"
+            debug["reason"] = "收盘价未同时大于 MA150 且 MA200"
             return debug
         if len(high_clean) >= 200:
             high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
@@ -285,38 +283,38 @@ def minervini_check_with_debug(data):
             if pd.notna(high_52w):
                 debug["high_52w_85pct"] = round(high_52w * 0.85, 2)
                 if last < high_52w * 0.85:
-                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.85,2)}"
+                    debug["reason"] = f"距 52 周高点太远：现价 {last} < {round(high_52w*0.85,2)}"
                     return debug
         debug["passed"] = True
         return debug
     except Exception as e:
-        debug["reason"] = f"計算錯誤：{str(e)}"
+        debug["reason"] = f"计算错误：{str(e)}"
         return debug
 
 def vcp_math_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 60:
-        debug["reason"] = "資料筆數不足 60"
+        debug["reason"] = "资料笔数不足 60"
         return debug
     close  = _get_col(data, "close", "Close")
     volume = _get_col(data, "Trading_Volume", "volume", "Volume")
     high   = _get_col(data, "max", "high", "High")
     low    = _get_col(data, "min", "low", "Low")
     if close is None or volume is None or high is None or low is None:
-        debug["reason"] = "缺少必要欄位"
+        debug["reason"] = "缺少必要栏位"
         return debug
     close  = pd.to_numeric(close, errors='coerce').dropna()
     high   = pd.to_numeric(high,  errors='coerce').dropna()
     low    = pd.to_numeric(low,   errors='coerce').dropna()
     volume = pd.to_numeric(volume, errors='coerce').dropna()
     if len(close) < 60 or len(volume) < 60:
-        debug["reason"] = f"有效資料不足：close {len(close)}, volume {len(volume)}"
+        debug["reason"] = f"有效资料不足：close {len(close)}, volume {len(volume)}"
         return debug
     try:
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
         if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
-            debug["reason"] = "vol_ma_20 為 NaN 或 0"
+            debug["reason"] = "vol_ma_20 为 NaN 或 0"
             return debug
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
         debug["vol_ratio"] = round(float(vol_ratio), 2)
@@ -342,14 +340,14 @@ def vcp_math_check_with_debug(data):
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
         if past_close <= 0:
-            debug["reason"] = "歷史收盤價無效"
+            debug["reason"] = "历史收盘价无效"
             return debug
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
         debug["rs"] = rs
 
         if rs < 85:
-            debug["reason"] = f"RS < 85 (實際 {rs})"
+            debug["reason"] = f"RS < 85 (实际 {rs})"
             return debug
 
         cond1 = (contractions >= 2) and (vol_ratio >= 1.4)
@@ -360,43 +358,43 @@ def vcp_math_check_with_debug(data):
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
-            debug["reason"] = f"未滿足任一條件 (c1:{cond1}, c2:{cond2}, c3:{cond3}, c4:{cond4}, c5:{cond5})"
+            debug["reason"] = f"未满足任一条件 (c1:{cond1}, c2:{cond2}, c3:{cond3}, c4:{cond4}, c5:{cond5})"
             return debug
         debug["passed"] = True
         return debug
     except Exception as e:
-        debug["reason"] = f"計算錯誤：{str(e)}"
+        debug["reason"] = f"计算错误：{str(e)}"
         return debug
 
 def build_report(total, results):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     if not results:
-        return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
+        return f"📉 <b>每日 VCP 报告 ({now_str})</b>\n扫描 {total} 档，无符合条件股票"
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-    msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
+    msg = f"📈 <b>每日 VCP 报告 ({now_str})</b>\n扫描 {total} 档，符合 {len(results)} 档\n\n"
     for i, c in enumerate(sorted_results[:15], 1):
         symbol = c['symbol']
         yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
-        msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
+        msg += f"🔹 <b>{symbol}</b> | 价:{c['price']} | RS:{c['rs_score']} | 品质:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== 掃描執行器 ==========
+# ========== 扫描执行器 ==========
 def _run_scan(scanner_func):
     global any_scan_running
     with scan_lock:
         if any_scan_running:
-            print("⚠️ 已有掃描在執行中，略過本次觸發")
+            print("⚠️ 已有扫描在执行中，略过本次触发")
             return
         any_scan_running = True
     try:
         scanner_func()
     except Exception as e:
-        print(f"💥 掃描線程崩潰：{e}")
+        print(f"💥 扫描线程崩溃：{e}")
     finally:
         with scan_lock:
             any_scan_running = False
 
-# ========== 手動掃描 ==========
+# ========== 手动扫描 ==========
 _manual_scan_status = {"running": False, "total": 0, "done": 0, "results": []}
 
 def manual_scanner():
@@ -407,7 +405,7 @@ def manual_scanner():
     stocks = get_filtered_stock_ids()
     if not stocks:
         _manual_scan_status["running"] = False
-        print("❌ 無股票清單，掃描終止")
+        print("❌ 无股票清单，扫描终止")
         return
     total = len(stocks)
     _manual_scan_status["total"] = total
@@ -424,18 +422,18 @@ def manual_scanner():
                 _manual_scan_status["results"].append(res)
         _manual_scan_status["done"] = idx
         if idx % 100 == 0:
-            print(f"📊 進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(_manual_scan_status['results'])}")
+            print(f"📊 进度：{idx}/{total}，第一层通过：{layer1_pass}，候选：{len(_manual_scan_status['results'])}")
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
+    print(f"✅ 手动扫描完成，第一层通过：{layer1_pass} 档，最终候选：{len(scan_results)} 档")
 
-# ========== 夜間背景掃描 ==========
+# ========== 夜间背景扫描 ==========
 def background_scanner():
     global scan_results, last_report_msg, _manual_scan_status
     stocks = get_filtered_stock_ids()
     if not stocks:
-        print("❌ 無股票清單，夜間掃描終止")
+        print("❌ 无股票清单，夜间扫描终止")
         return
     total = len(stocks)
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
@@ -450,7 +448,7 @@ def background_scanner():
             if res:
                 local_results.append(res)
         if idx % 100 == 0:
-            print(f"📊 背景掃描進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(local_results)}")
+            print(f"📊 背景扫描进度：{idx}/{total}，第一层通过：{layer1_pass}，候选：{len(local_results)}")
     with scan_lock:
         scan_results = local_results
     _manual_scan_status["running"] = False
@@ -458,9 +456,9 @@ def background_scanner():
     _manual_scan_status["done"] = total
     _manual_scan_status["results"] = local_results
     last_report_msg = build_report(total, scan_results)
-    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
+    print(f"✅ 背景扫描完成，第一层通过：{layer1_pass} 档，最终候选：{len(scan_results)} 档")
 
-# ========== API 端點 ==========
+# ========== API 端点 ==========
 @app.get("/start_scan_async")
 def start_scan_async():
     global any_scan_running
@@ -538,31 +536,30 @@ def debug_scan(symbol: str = "3008"):
     end_date = datetime.today().strftime("%Y-%m-%d")
     df = fetch_daily(symbol, start_date, end_date)
     if df is None:
-        result["step1_fetch"] = "下載失敗"
+        result["step1_fetch"] = "下载失败"
         return convert_numpy(result)
     result["step1_fetch"] = {
         "rows": len(df),
         "columns": df.columns.tolist(),
-        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無 close",
-        "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "無 max",
+        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "无 close",
+        "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "无 max",
     }
     result["step2_minervini"] = minervini_check_with_debug(df)
     if result["step2_minervini"].get("passed"):
         result["step3_vcp"] = vcp_math_check_with_debug(df)
     else:
-        result["step3_vcp"] = "未執行（Minervini 未通過）"
+        result["step3_vcp"] = "未执行（Minervini 未通过）"
     return convert_numpy(result)
 
-# 新增：完整報告端點（HTML 表格）
-@app.get("/full_report")
+@app.get("/full_report", response_class=HTMLResponse)
 def full_report():
-    # 優先使用手動掃描結果，否則使用夜間掃描結果
+    # 优先使用手动扫描结果，否则使用夜间扫描结果
     results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
-    total = len(get_filtered_stock_ids()) if not _manual_scan_status["total"] else _manual_scan_status["total"]
+    total = _manual_scan_status["total"] if _manual_scan_status["total"] else len(get_filtered_stock_ids())
     if not results:
-        return HTML(content="<html><body><h2>尚無篩選結果</h2></body></html>")
+        return HTMLResponse(content="<html><body><h2>尚无筛选结果</h2></body></html>")
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-    html = f"""<html><head><meta charset='utf-8'><title>VCP 完整報告</title>
+    html = f"""<html><head><meta charset='utf-8'><title>VCP 完整报告</title>
     <style>
         body {{ background: #060d16; color: #e2f0ff; font-family: sans-serif; padding: 20px; }}
         table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
@@ -570,17 +567,13 @@ def full_report():
         td {{ padding: 6px; border-bottom: 1px solid #1a2d40; }}
         a {{ color: #38bdf8; }}
     </style></head><body>
-    <h2>📈 VCP 完整篩選報告</h2>
-    <p>掃描 {total} 檔，符合 {len(sorted_results)} 檔</p>
-    <table><tr><th>代號</th><th>股價</th><th>漲跌%</th><th>RS</th><th>收縮次數</th><th>量比</th><th>品質</th><th>Yahoo</th></tr>"""
+    <h2>📈 VCP 完整筛选报告</h2>
+    <p>扫描 {total} 档，符合 {len(sorted_results)} 档</p>
+    <table><tr><th>代号</th><th>股价</th><th>涨跌%</th><th>RS</th><th>收缩次数</th><th>量比</th><th>品质</th><th>Yahoo</th></tr>"""
     for c in sorted_results:
         html += f"<tr><td>{c['symbol']}</td><td>{c['price']}</td><td>{c['change_pct']:+.2f}%</td><td>{c['rs_score']}</td><td>{c['contractions']}</td><td>{c['volume_ratio']}</td><td>{c['quality']}</td><td><a href='https://tw.stock.yahoo.com/quote/{c['symbol']}' target='_blank'>Yahoo</a></td></tr>"
     html += "</table></body></html>"
-    return HTML(content=html)
-
-from fastapi.responses import HTMLResponse
-from fastapi import FastAPI, Query
-app.get("/full_report", response_class=HTMLResponse)(full_report)
+    return HTMLResponse(content=html)
 
 if __name__ == "__main__":
     import uvicorn
