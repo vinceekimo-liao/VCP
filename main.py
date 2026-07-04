@@ -1,6 +1,11 @@
 import os
 import time
 import threading
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -11,10 +16,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from FinMind.data import DataLoader
-
-# 新增 Google Sheets 相關匯入
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 app.add_middleware(
@@ -29,9 +30,13 @@ app.add_middleware(
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-# Google Sheets 設定
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+
+# Email 設定
+EMAIL_SMTP_SERVER = os.environ.get("EMAIL_SMTP_SERVER", "smtp.gmail.com")
+EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
+EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER", "")
 
 # ========== 全域變數 ==========
 scan_results = []
@@ -64,46 +69,54 @@ def send_telegram_msg(message):
     except Exception as e:
         print(f"Telegram 發送失敗：{e}")
 
-def upload_to_google_sheet(results, total):
-    """將結果寫入 Google Sheets，覆蓋第一個工作表"""
-    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
-        print("⚠️ 缺少 Google Sheets 設定")
+def send_email_report(results, total_scanned):
+    """將結果匯出為 Excel 並寄送 Email"""
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+        print("⚠️ Email 設定不完整，跳過寄送")
         return
+    if not results:
+        print("⚠️ 無候選股票，不寄送 Email")
+        return
+
     try:
-        # 解析 JSON 憑證
-        import json
-        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        df = pd.DataFrame(results)
+        # 排序並重新命名欄位
+        df = df.sort_values("rs_score", ascending=False)
+        df = df.rename(columns={
+            "symbol": "代號", "price": "股價", "change_pct": "漲跌幅%",
+            "rs_score": "RS", "contractions": "收縮次數",
+            "volume_ratio": "量比", "quality": "品質"
+        })
 
-        # 清空現有內容（保留第一行標題）
-        sheet.clear()
-        # 寫入標題行
-        headers = ["代號", "股價", "漲跌%", "RS", "收縮次數", "量比", "品質", "Yahoo連結"]
-        sheet.append_row(headers)
+        # 存成 Excel
+        filename = f"VCP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        df.to_excel(filename, index=False)
 
-        # 寫入數據（最多 500 行，避免超出限制）
-        sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-        rows = []
-        for c in sorted_results[:500]:
-            yahoo_link = f"https://tw.stock.yahoo.com/quote/{c['symbol']}"
-            rows.append([
-                c['symbol'],
-                c['price'],
-                f"{c['change_pct']:+.2f}%",
-                c['rs_score'],
-                c['contractions'],
-                c['volume_ratio'],
-                c['quality'],
-                yahoo_link
-            ])
-        if rows:
-            sheet.append_rows(rows)
-        print(f"📊 Google Sheets 已更新：{len(rows)} 筆")
+        # 建立郵件
+        msg = MIMEMultipart()
+        msg["From"] = EMAIL_SENDER
+        msg["To"] = EMAIL_RECEIVER
+        msg["Subject"] = f"📈 VCP 每日報告 {datetime.now().strftime('%Y-%m-%d')}"
+        body = f"今日共掃描 {total_scanned} 檔，符合條件 {len(results)} 檔。\n詳細請見附件。"
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        # 附加檔案
+        with open(filename, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f"attachment; filename={filename}")
+        msg.attach(part)
+
+        # 寄送
+        server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        server.quit()
+        print(f"✅ Email 已寄送至 {EMAIL_RECEIVER}")
     except Exception as e:
-        print(f"Google Sheets 寫入失敗：{e}")
+        print(f"❌ Email 寄送失敗：{e}")
 
 def convert_numpy(obj):
     if isinstance(obj, dict):
@@ -189,7 +202,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（維持：距52週高點90%以內） ==========
+# ========== 第一層：Minervini（維持90%） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -215,7 +228,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（條件維持，小幅收緊 cond4/cond5） ==========
+# ========== 第二層：VCP（再次微收緊） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -265,22 +278,24 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        if rs < 88:
+        # ── 微收緊條件 ──
+        if rs < 90:                     # 從 88 提高到 90
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.6)
-        cond2 = (contractions >= 1) and (vol_ratio >= 2.0)
-        cond3 = (today_change > 5.0) and (vol_ratio > 2.5)
-        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 99)
-        cond5 = (contractions >= 8) and (vol_ratio >= 0.9) and (rs >= 99)
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.8)                     # 量比 1.6→1.8
+        cond2 = (contractions >= 1) and (vol_ratio >= 2.2)                    # 量比 2.0→2.2
+        cond3 = (today_change > 6.0) and (vol_ratio > 3.0)                   # 漲幅 5→6, 量比 2.5→3.0
+        cond4 = (contractions >= 11) and (vol_ratio >= 0.8) and (rs >= 99)   # 收縮 10→11
+        cond5 = (contractions >= 9) and (vol_ratio >= 0.9) and (rs >= 99)    # 收縮 8→9
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
+        # 品質評分（微調）
         qs = 0
         if contractions >= 3: qs += 1
-        if vol_ratio >= 1.7: qs += 1
-        if rs >= 92: qs += 1
+        if vol_ratio >= 1.8: qs += 1     # 1.7→1.8
+        if rs >= 93: qs += 1            # 92→93
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
         return {
@@ -296,10 +311,122 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數 (略，與正式版相同) ==========
-# (為節省篇幅，此處省略，但實際部署時請保留先前提供的除錯函數)
-def minervini_check_with_debug(data): ...
-def vcp_math_check_with_debug(data): ...
+# ========== 除錯版函數（同步更新條件） ==========
+def minervini_check_with_debug(data):
+    debug = {"passed": False, "reason": ""}
+    if data is None or len(data) < 200:
+        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
+        return debug
+    close = _get_col(data, "close", "Close")
+    high  = _get_col(data, "max", "high", "High")
+    if close is None or high is None:
+        debug["reason"] = f"缺少欄位：close={close is not None}, high/max={high is not None}"
+        return debug
+    close_clean = pd.to_numeric(close, errors='coerce').dropna()
+    high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
+    if len(close_clean) < 200 or len(high_clean) < 200:
+        debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high/max {len(high_clean)}"
+        return debug
+    try:
+        ma150 = close_clean.rolling(150).mean()
+        ma200 = close_clean.rolling(200).mean()
+        last  = close_clean.iloc[-1]
+        debug["last"] = round(last, 2)
+        debug["ma150"] = round(ma150.iloc[-1], 2) if not pd.isna(ma150.iloc[-1]) else "NaN"
+        debug["ma200"] = round(ma200.iloc[-1], 2) if not pd.isna(ma200.iloc[-1]) else "NaN"
+        cond_ma = (last > ma150.iloc[-1]) and (last > ma200.iloc[-1])
+        debug["cond_ma"] = cond_ma
+        if not cond_ma:
+            debug["reason"] = "收盤價未同時大於 MA150 且 MA200"
+            return debug
+        if len(high_clean) >= 200:
+            high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
+            debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
+            if pd.notna(high_52w):
+                debug["high_52w_90pct"] = round(high_52w * 0.90, 2)
+                if last < high_52w * 0.90:
+                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.90,2)}"
+                    return debug
+        debug["passed"] = True
+        return debug
+    except Exception as e:
+        debug["reason"] = f"計算錯誤：{str(e)}"
+        return debug
+
+def vcp_math_check_with_debug(data):
+    debug = {"passed": False, "reason": ""}
+    if data is None or len(data) < 60:
+        debug["reason"] = "資料筆數不足 60"
+        return debug
+    close  = _get_col(data, "close", "Close")
+    volume = _get_col(data, "Trading_Volume", "volume", "Volume")
+    high   = _get_col(data, "max", "high", "High")
+    low    = _get_col(data, "min", "low", "Low")
+    if close is None or volume is None or high is None or low is None:
+        debug["reason"] = "缺少必要欄位"
+        return debug
+    close  = pd.to_numeric(close, errors='coerce').dropna()
+    high   = pd.to_numeric(high,  errors='coerce').dropna()
+    low    = pd.to_numeric(low,   errors='coerce').dropna()
+    volume = pd.to_numeric(volume, errors='coerce').dropna()
+    if len(close) < 60 or len(volume) < 60:
+        debug["reason"] = f"有效資料不足：close {len(close)}, volume {len(volume)}"
+        return debug
+    try:
+        vol_ma_20 = volume.rolling(20).mean()
+        recent_vol = volume.iloc[-3:].mean()
+        if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
+            debug["reason"] = "vol_ma_20 為 NaN 或 0"
+            return debug
+        vol_ratio = recent_vol / vol_ma_20.iloc[-1]
+        debug["vol_ratio"] = round(float(vol_ratio), 2)
+
+        contractions = 0
+        in_pullback = False
+        for i in range(5, len(close)):
+            try:
+                pc = (close.iloc[i] - close.iloc[i-5]) / close.iloc[i-5] * 100
+                vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
+            except:
+                continue
+            if not in_pullback and pc < -2 and vc < -15:
+                in_pullback = True
+            if in_pullback and pc > 0:
+                contractions += 1
+                in_pullback = False
+        debug["contractions"] = contractions
+
+        today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
+        debug["today_change"] = round(today_change, 2)
+
+        rs_lookback = min(60, len(close))
+        past_close = close.iloc[-rs_lookback]
+        if past_close <= 0:
+            debug["reason"] = "歷史收盤價無效"
+            return debug
+        rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
+        rs = int(max(1, min(99, round(float(rs_raw)))))
+        debug["rs"] = rs
+
+        if rs < 90:
+            debug["reason"] = f"RS < 90 (實際 {rs})"
+            return debug
+
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.8)
+        cond2 = (contractions >= 1) and (vol_ratio >= 2.2)
+        cond3 = (today_change > 6.0) and (vol_ratio > 3.0)
+        cond4 = (contractions >= 11) and (vol_ratio >= 0.8) and (rs >= 99)
+        cond5 = (contractions >= 9) and (vol_ratio >= 0.9) and (rs >= 99)
+        passed = cond1 or cond2 or cond3 or cond4 or cond5
+        debug["passed_vcp"] = passed
+        if not passed:
+            debug["reason"] = f"未滿足任一條件 (c1:{cond1}, c2:{cond2}, c3:{cond3}, c4:{cond4}, c5:{cond5})"
+            return debug
+        debug["passed"] = True
+        return debug
+    except Exception as e:
+        debug["reason"] = f"計算錯誤：{str(e)}"
+        return debug
 
 def build_report(total, results):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -318,7 +445,7 @@ def _run_scan(scanner_func):
     global any_scan_running
     with scan_lock:
         if any_scan_running:
-            print("⚠️ 已有掃描在執行中")
+            print("⚠️ 已有掃描在執行中，略過本次觸發")
             return
         any_scan_running = True
     try:
@@ -340,6 +467,7 @@ def manual_scanner():
     stocks = get_filtered_stock_ids()
     if not stocks:
         _manual_scan_status["running"] = False
+        print("❌ 無股票清單，掃描終止")
         return
     total = len(stocks)
     _manual_scan_status["total"] = total
@@ -360,13 +488,16 @@ def manual_scanner():
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass}，最終候選：{len(scan_results)}")
+    # 掃描完成後寄送 Email
+    send_email_report(_manual_scan_status["results"], total)
+    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
 # ========== 夜間背景掃描 ==========
 def background_scanner():
     global scan_results, last_report_msg, _manual_scan_status
     stocks = get_filtered_stock_ids()
     if not stocks:
+        print("❌ 無股票清單，夜間掃描終止")
         return
     total = len(stocks)
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
@@ -389,11 +520,10 @@ def background_scanner():
     _manual_scan_status["done"] = total
     _manual_scan_status["results"] = local_results
     last_report_msg = build_report(total, scan_results)
-    # Telegram 通知
     send_telegram_msg(last_report_msg)
-    # Google Sheets 寫入
-    upload_to_google_sheet(scan_results, total)
-    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass}，最終候選：{len(scan_results)}")
+    # 寄送 Email
+    send_email_report(scan_results, total)
+    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
 
 # ========== API 端點 ==========
 @app.get("/start_scan_async")
@@ -418,30 +548,49 @@ def start_scan():
 def scan_status():
     try:
         if _manual_scan_status["running"]:
-            return {"running": True, "total": _manual_scan_status["total"], "done": _manual_scan_status["done"], "candidates": []}
+            return {
+                "running": True,
+                "total": _manual_scan_status["total"],
+                "done": _manual_scan_status["done"],
+                "candidates": []
+            }
         if _manual_scan_status["results"]:
-            return {"running": False, "total": _manual_scan_status["total"], "done": _manual_scan_status["done"], "candidates": _manual_scan_status["results"]}
+            return {
+                "running": False,
+                "total": _manual_scan_status["total"],
+                "done": _manual_scan_status["done"],
+                "candidates": _manual_scan_status["results"]
+            }
         with scan_lock:
             if scan_results:
-                return {"running": False, "total": len(get_filtered_stock_ids()), "done": len(scan_results), "candidates": scan_results}
+                return {
+                    "running": False,
+                    "total": len(get_filtered_stock_ids()),
+                    "done": len(scan_results),
+                    "candidates": scan_results
+                }
         return {"running": False, "total": 0, "done": 0, "candidates": []}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []}
 
 @app.get("/send_report")
 def send_report():
     global scan_results, last_report_msg
     total = len(get_filtered_stock_ids())
-    results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
-    msg = build_report(total, results)
+    if _manual_scan_status["results"]:
+        msg = build_report(total, _manual_scan_status["results"])
+    else:
+        msg = build_report(total, scan_results)
     last_report_msg = msg
     send_telegram_msg(msg)
-    # 同時寫入 Google Sheets
-    upload_to_google_sheet(results, total)
+    # 同時寄送 Email
+    current_results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
+    send_email_report(current_results, total)
     return {"status": "report sent"}
 
 @app.get("/latest_report")
 def latest_report():
+    global last_report_msg
     return {"report": last_report_msg}
 
 @app.get("/health")
@@ -452,8 +601,25 @@ def health():
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    # 保留原邏輯，此處簡化
-    return {"status": "ok"}
+    result = {"symbol": symbol, "step1_fetch": None, "step2_minervini": None, "step3_vcp": None}
+    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+    end_date = datetime.today().strftime("%Y-%m-%d")
+    df = fetch_daily(symbol, start_date, end_date)
+    if df is None:
+        result["step1_fetch"] = "下載失敗"
+        return convert_numpy(result)
+    result["step1_fetch"] = {
+        "rows": len(df),
+        "columns": df.columns.tolist(),
+        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無 close",
+        "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "無 max",
+    }
+    result["step2_minervini"] = minervini_check_with_debug(df)
+    if result["step2_minervini"].get("passed"):
+        result["step3_vcp"] = vcp_math_check_with_debug(df)
+    else:
+        result["step3_vcp"] = "未執行（Minervini 未通過）"
+    return convert_numpy(result)
 
 @app.get("/full_report", response_class=HTMLResponse)
 def full_report():
@@ -463,7 +629,8 @@ def full_report():
         return HTMLResponse(content="<html><body><h2>尚無篩選結果</h2></body></html>")
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
     html = f"""<html><head><meta charset='utf-8'><title>VCP 完整報告</title>
-    <style> body {{ background: #060d16; color: #e2f0ff; font-family: sans-serif; padding: 20px; }}
+    <style>
+        body {{ background: #060d16; color: #e2f0ff; font-family: sans-serif; padding: 20px; }}
         table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
         th {{ background: #1a2d40; padding: 6px; text-align: left; }}
         td {{ padding: 6px; border-bottom: 1px solid #1a2d40; }}
