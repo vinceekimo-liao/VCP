@@ -1,6 +1,8 @@
 import os
 import time
 import threading
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -25,6 +27,12 @@ app.add_middleware(
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Email 設定 (使用 SMTP)
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", 587))
+EMAIL_USER = os.environ.get("EMAIL_USER", "")
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+EMAIL_TO = os.environ.get("EMAIL_TO", "")
 
 # ========== 全域變數 ==========
 scan_results = []
@@ -56,6 +64,25 @@ def send_telegram_msg(message):
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         print(f"Telegram 發送失敗：{e}")
+
+def send_email(subject, body):
+    """通過 SMTP 發送 Email"""
+    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
+        print("⚠️ 缺少 Email 設定")
+        return
+    msg = MIMEText(body, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_USER
+    msg["To"] = EMAIL_TO
+    try:
+        server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
+        server.quit()
+        print("📧 Email 已發送")
+    except Exception as e:
+        print(f"Email 發送失敗：{e}")
 
 def convert_numpy(obj):
     if isinstance(obj, dict):
@@ -141,7 +168,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 第一層：Minervini（收緊：距52週高點90%以內） ==========
+# ========== 第一層：Minervini（維持：距52週高點90%以內） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -159,7 +186,6 @@ def minervini_check(data):
         last  = close.iloc[-1]
         if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
-        # 收緊至 90%
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
             if pd.notna(high_52w) and last < high_52w * 0.90:
@@ -168,7 +194,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（再次收緊：RS>=88） ==========
+# ========== 第二層：VCP（再小幅收緊） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -218,20 +244,19 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # ── 收緊條件 ──
-        if rs < 88:                     # 提高 RS 門檻
+        # ── 條件微調：主要提高 cond4/cond5 的 RS 門檻 ──
+        if rs < 88:
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.6)                     # 收縮＋量能提升
-        cond2 = (contractions >= 1) and (vol_ratio >= 2.0)                    # 嚴格帶量收縮
-        cond3 = (today_change > 5.0) and (vol_ratio > 2.5)                   # 更強的突破
-        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 99)   # 高收縮＋極高 RS
-        cond5 = (contractions >= 8) and (vol_ratio >= 0.9) and (rs >= 99)    # 中收縮＋極高 RS
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.6)
+        cond2 = (contractions >= 1) and (vol_ratio >= 2.0)
+        cond3 = (today_change > 5.0) and (vol_ratio > 2.5)
+        cond4 = (contractions >= 10) and (vol_ratio >= 0.8) and (rs >= 99)
+        cond5 = (contractions >= 8) and (vol_ratio >= 0.9) and (rs >= 99)
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
-        # 品質評分（略作調整）
         qs = 0
         if contractions >= 3: qs += 1
         if vol_ratio >= 1.7: qs += 1
@@ -251,21 +276,21 @@ def vcp_math_check(data):
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數（保持與正式版一致的條件） ==========
+# ========== 除錯版函數（與正式版一致） ==========
 def minervini_check_with_debug(data):
     debug = {"passed": False, "reason": ""}
     if data is None or len(data) < 200:
-        debug["reason"] = f"資料筆數不足：{len(data) if data is not None else 'None'}"
+        debug["reason"] = f"資料筆數不足"
         return debug
     close = _get_col(data, "close", "Close")
     high  = _get_col(data, "max", "high", "High")
     if close is None or high is None:
-        debug["reason"] = f"缺少欄位：close={close is not None}, high/max={high is not None}"
+        debug["reason"] = "缺少欄位"
         return debug
     close_clean = pd.to_numeric(close, errors='coerce').dropna()
     high_clean  = pd.to_numeric(high,  errors='coerce').dropna()
     if len(close_clean) < 200 or len(high_clean) < 200:
-        debug["reason"] = f"去除 NaN 後資料不足：close {len(close_clean)}, high/max {len(high_clean)}"
+        debug["reason"] = "有效資料不足"
         return debug
     try:
         ma150 = close_clean.rolling(150).mean()
@@ -281,12 +306,9 @@ def minervini_check_with_debug(data):
             return debug
         if len(high_clean) >= 200:
             high_52w = high_clean.rolling(250, min_periods=1).max().iloc[-1]
-            debug["high_52w"] = round(high_52w, 2) if pd.notna(high_52w) else "NaN"
-            if pd.notna(high_52w):
-                debug["high_52w_90pct"] = round(high_52w * 0.90, 2)
-                if last < high_52w * 0.90:
-                    debug["reason"] = f"距 52 週高點太遠：現價 {last} < {round(high_52w*0.90,2)}"
-                    return debug
+            if pd.notna(high_52w) and last < high_52w * 0.90:
+                debug["reason"] = "距 52 週高點太遠"
+                return debug
         debug["passed"] = True
         return debug
     except Exception as e:
@@ -300,27 +322,22 @@ def vcp_math_check_with_debug(data):
         return debug
     close  = _get_col(data, "close", "Close")
     volume = _get_col(data, "Trading_Volume", "volume", "Volume")
-    high   = _get_col(data, "max", "high", "High")
-    low    = _get_col(data, "min", "low", "Low")
-    if close is None or volume is None or high is None or low is None:
-        debug["reason"] = "缺少必要欄位"
+    if close is None or volume is None:
+        debug["reason"] = "缺少欄位"
         return debug
     close  = pd.to_numeric(close, errors='coerce').dropna()
-    high   = pd.to_numeric(high,  errors='coerce').dropna()
-    low    = pd.to_numeric(low,   errors='coerce').dropna()
     volume = pd.to_numeric(volume, errors='coerce').dropna()
     if len(close) < 60 or len(volume) < 60:
-        debug["reason"] = f"有效資料不足：close {len(close)}, volume {len(volume)}"
+        debug["reason"] = "有效資料不足"
         return debug
     try:
         vol_ma_20 = volume.rolling(20).mean()
         recent_vol = volume.iloc[-3:].mean()
         if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
-            debug["reason"] = "vol_ma_20 為 NaN 或 0"
+            debug["reason"] = "vol_ma_20 無效"
             return debug
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
         debug["vol_ratio"] = round(float(vol_ratio), 2)
-
         contractions = 0
         in_pullback = False
         for i in range(5, len(close)):
@@ -335,23 +352,18 @@ def vcp_math_check_with_debug(data):
                 contractions += 1
                 in_pullback = False
         debug["contractions"] = contractions
-
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
         debug["today_change"] = round(today_change, 2)
-
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
         if past_close <= 0:
             debug["reason"] = "歷史收盤價無效"
             return debug
-        rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
-        rs = int(max(1, min(99, round(float(rs_raw)))))
+        rs = int(max(1, min(99, round(float(50 + (close.iloc[-1] - past_close) / past_close * 200)))))
         debug["rs"] = rs
-
         if rs < 88:
             debug["reason"] = f"RS < 88 (實際 {rs})"
             return debug
-
         cond1 = (contractions >= 2) and (vol_ratio >= 1.6)
         cond2 = (contractions >= 1) and (vol_ratio >= 2.0)
         cond3 = (today_change > 5.0) and (vol_ratio > 2.5)
@@ -360,7 +372,7 @@ def vcp_math_check_with_debug(data):
         passed = cond1 or cond2 or cond3 or cond4 or cond5
         debug["passed_vcp"] = passed
         if not passed:
-            debug["reason"] = f"未滿足任一條件 (c1:{cond1}, c2:{cond2}, c3:{cond3}, c4:{cond4}, c5:{cond5})"
+            debug["reason"] = f"未滿足任一條件"
             return debug
         debug["passed"] = True
         return debug
@@ -385,7 +397,7 @@ def _run_scan(scanner_func):
     global any_scan_running
     with scan_lock:
         if any_scan_running:
-            print("⚠️ 已有掃描在執行中，略過本次觸發")
+            print("⚠️ 已有掃描在執行中")
             return
         any_scan_running = True
     try:
@@ -407,7 +419,6 @@ def manual_scanner():
     stocks = get_filtered_stock_ids()
     if not stocks:
         _manual_scan_status["running"] = False
-        print("❌ 無股票清單，掃描終止")
         return
     total = len(stocks)
     _manual_scan_status["total"] = total
@@ -428,14 +439,13 @@ def manual_scanner():
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
+    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass}，最終候選：{len(scan_results)}")
 
 # ========== 夜間背景掃描 ==========
 def background_scanner():
     global scan_results, last_report_msg, _manual_scan_status
     stocks = get_filtered_stock_ids()
     if not stocks:
-        print("❌ 無股票清單，夜間掃描終止")
         return
     total = len(stocks)
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
@@ -458,7 +468,18 @@ def background_scanner():
     _manual_scan_status["done"] = total
     _manual_scan_status["results"] = local_results
     last_report_msg = build_report(total, scan_results)
-    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
+    # Telegram 通知
+    send_telegram_msg(last_report_msg)
+    # Email 通知 (帶完整 HTML 表格)
+    if scan_results:
+        sorted_results = sorted(scan_results, key=lambda x: -x["rs_score"])
+        html_table = "<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse; font-size:12px;'>"
+        html_table += "<tr><th>代號</th><th>股價</th><th>漲跌%</th><th>RS</th><th>收縮次數</th><th>量比</th><th>品質</th></tr>"
+        for c in sorted_results:
+            html_table += f"<tr><td>{c['symbol']}</td><td>{c['price']}</td><td>{c['change_pct']:+.2f}%</td><td>{c['rs_score']}</td><td>{c['contractions']}</td><td>{c['volume_ratio']}</td><td>{c['quality']}</td></tr>"
+        html_table += "</table>"
+        send_email("每日 VCP 掃描報告", f"<h3>📈 VCP 掃描結果 ({datetime.now().strftime('%Y-%m-%d %H:%M')})</h3><p>掃描 {total} 檔，符合 {len(scan_results)} 檔</p>{html_table}")
+    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass}，最終候選：{len(scan_results)}")
 
 # ========== API 端點 ==========
 @app.get("/start_scan_async")
@@ -483,30 +504,15 @@ def start_scan():
 def scan_status():
     try:
         if _manual_scan_status["running"]:
-            return {
-                "running": True,
-                "total": _manual_scan_status["total"],
-                "done": _manual_scan_status["done"],
-                "candidates": []
-            }
+            return {"running": True, "total": _manual_scan_status["total"], "done": _manual_scan_status["done"], "candidates": []}
         if _manual_scan_status["results"]:
-            return {
-                "running": False,
-                "total": _manual_scan_status["total"],
-                "done": _manual_scan_status["done"],
-                "candidates": _manual_scan_status["results"]
-            }
+            return {"running": False, "total": _manual_scan_status["total"], "done": _manual_scan_status["done"], "candidates": _manual_scan_status["results"]}
         with scan_lock:
             if scan_results:
-                return {
-                    "running": False,
-                    "total": len(get_filtered_stock_ids()),
-                    "done": len(scan_results),
-                    "candidates": scan_results
-                }
+                return {"running": False, "total": len(get_filtered_stock_ids()), "done": len(scan_results), "candidates": scan_results}
         return {"running": False, "total": 0, "done": 0, "candidates": []}
     except Exception as e:
-        return {"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []}
+        return {"error": str(e)}
 
 @app.get("/send_report")
 def send_report():
@@ -518,11 +524,19 @@ def send_report():
         msg = build_report(total, scan_results)
     last_report_msg = msg
     send_telegram_msg(msg)
+    # 也發送 Email
+    sorted_results = sorted(_manual_scan_status["results"] if _manual_scan_status["results"] else scan_results, key=lambda x: -x["rs_score"])
+    if sorted_results:
+        html_table = "<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse; font-size:12px;'>"
+        html_table += "<tr><th>代號</th><th>股價</th><th>漲跌%</th><th>RS</th><th>收縮次數</th><th>量比</th><th>品質</th></tr>"
+        for c in sorted_results:
+            html_table += f"<tr><td>{c['symbol']}</td><td>{c['price']}</td><td>{c['change_pct']:+.2f}%</td><td>{c['rs_score']}</td><td>{c['contractions']}</td><td>{c['volume_ratio']}</td><td>{c['quality']}</td></tr>"
+        html_table += "</table>"
+        send_email("每日 VCP 掃描報告", f"<h3>📈 VCP 掃描結果 ({datetime.now().strftime('%Y-%m-%d %H:%M')})</h3><p>掃描 {total} 檔，符合 {len(sorted_results)} 檔</p>{html_table}")
     return {"status": "report sent"}
 
 @app.get("/latest_report")
 def latest_report():
-    global last_report_msg
     return {"report": last_report_msg}
 
 @app.get("/health")
@@ -543,8 +557,8 @@ def debug_scan(symbol: str = "3008"):
     result["step1_fetch"] = {
         "rows": len(df),
         "columns": df.columns.tolist(),
-        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無 close",
-        "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "無 max",
+        "tail_close": df["close"].tail(5).tolist() if "close" in df.columns else "無",
+        "tail_max": df["max"].tail(5).tolist() if "max" in df.columns else "無",
     }
     result["step2_minervini"] = minervini_check_with_debug(df)
     if result["step2_minervini"].get("passed"):
@@ -555,7 +569,6 @@ def debug_scan(symbol: str = "3008"):
 
 @app.get("/full_report", response_class=HTMLResponse)
 def full_report():
-    # 優先使用手動掃描結果，否則使用夜間掃描結果
     results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
     total = _manual_scan_status["total"] if _manual_scan_status["total"] else len(get_filtered_stock_ids())
     if not results:
