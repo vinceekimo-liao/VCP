@@ -70,29 +70,32 @@ def send_telegram_msg(message):
         print(f"Telegram 發送失敗：{e}")
 
 def send_email_report(results, total_scanned):
-    """將結果匯出為 Excel 並寄送 Email"""
+    """將結果匯出為 Excel 並寄送 Email（增強錯誤診斷）"""
+    # 1. 檢查必要參數
     if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
-        print("⚠️ Email 設定不完整，跳過寄送")
+        print("⚠️ Email 設定不完整，缺少 EMAIL_SENDER, EMAIL_PASSWORD 或 EMAIL_RECEIVER")
+        print(f"   EMAIL_SENDER={'已設定' if EMAIL_SENDER else '❌ 未設定'}")
+        print(f"   EMAIL_PASSWORD={'已設定' if EMAIL_PASSWORD else '❌ 未設定'}")
+        print(f"   EMAIL_RECEIVER={'已設定' if EMAIL_RECEIVER else '❌ 未設定'}")
         return
     if not results:
         print("⚠️ 無候選股票，不寄送 Email")
         return
 
     try:
+        # 2. 建立 DataFrame 並存成 Excel
         df = pd.DataFrame(results)
-        # 排序並重新命名欄位
         df = df.sort_values("rs_score", ascending=False)
         df = df.rename(columns={
             "symbol": "代號", "price": "股價", "change_pct": "漲跌幅%",
             "rs_score": "RS", "contractions": "收縮次數",
             "volume_ratio": "量比", "quality": "品質"
         })
-
-        # 存成 Excel
         filename = f"VCP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         df.to_excel(filename, index=False)
+        print(f"📁 Excel 檔案已產生：{filename}")
 
-        # 建立郵件
+        # 3. 建立郵件
         msg = MIMEMultipart()
         msg["From"] = EMAIL_SENDER
         msg["To"] = EMAIL_RECEIVER
@@ -100,7 +103,7 @@ def send_email_report(results, total_scanned):
         body = f"今日共掃描 {total_scanned} 檔，符合條件 {len(results)} 檔。\n詳細請見附件。"
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        # 附加檔案
+        # 4. 附加檔案
         with open(filename, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -108,15 +111,26 @@ def send_email_report(results, total_scanned):
         part.add_header("Content-Disposition", f"attachment; filename={filename}")
         msg.attach(part)
 
-        # 寄送
-        server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT)
-        server.starttls()
+        # 5. 嘗試寄送（使用 SMTP_SSL 或 STARTTLS）
+        print(f"📧 嘗試寄送 Email：{EMAIL_SENDER} -> {EMAIL_RECEIVER} via {EMAIL_SMTP_SERVER}:{EMAIL_SMTP_PORT}")
+        if EMAIL_SMTP_PORT == 465:
+            # SSL 直接加密
+            server = smtplib.SMTP_SSL(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT, timeout=10)
+        else:
+            # STARTTLS
+            server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT, timeout=10)
+            server.starttls()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
         server.quit()
         print(f"✅ Email 已寄送至 {EMAIL_RECEIVER}")
+
+    except smtplib.SMTPAuthenticationError:
+        print("❌ SMTP 認證失敗！請檢查 EMAIL_PASSWORD 是否為「應用程式密碼」（不是你的 Gmail 登入密碼）")
+    except smtplib.SMTPConnectError:
+        print(f"❌ 無法連線到 SMTP 伺服器 {EMAIL_SMTP_SERVER}:{EMAIL_SMTP_PORT}，請檢查網路或防火牆設定")
     except Exception as e:
-        print(f"❌ Email 寄送失敗：{e}")
+        print(f"❌ Email 寄送失敗：{type(e).__name__} - {str(e)}")
 
 def convert_numpy(obj):
     if isinstance(obj, dict):
