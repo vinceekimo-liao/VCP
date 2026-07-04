@@ -1,11 +1,7 @@
 import os
 import time
 import threading
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
+
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -17,6 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from FinMind.data import DataLoader
 
+import resend                          # 新增 Resend SDK
+
+# 在環境變數區塊新增 RESEND_API_KEY
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +26,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ========== 環境變數 ==========
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
@@ -70,16 +72,21 @@ def send_telegram_msg(message):
         print(f"Telegram 發送失敗：{e}")
 
 def send_email_report(results, total_scanned):
-    """將結果匯出為 Excel 並寄送 Email（自動清理 SMTP 伺服器位址）"""
-    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
-        print("⚠️ Email 設定不完整，跳過寄送")
+    """使用 Resend API 寄送含 Excel 附件的報告"""
+    if not RESEND_API_KEY:
+        print("⚠️ 未設定 RESEND_API_KEY，跳過 Email 寄送")
+        return
+    if not EMAIL_SENDER or not EMAIL_RECEIVER:
+        print("⚠️ 缺少 EMAIL_SENDER 或 EMAIL_RECEIVER，跳過寄送")
         return
     if not results:
         print("⚠️ 無候選股票，不寄送 Email")
         return
 
+    resend.api_key = RESEND_API_KEY
+
     try:
-        # 建立 DataFrame 並存成 Excel
+        # 建立 Excel 檔案
         df = pd.DataFrame(results)
         df = df.sort_values("rs_score", ascending=False)
         df = df.rename(columns={
@@ -91,47 +98,25 @@ def send_email_report(results, total_scanned):
         df.to_excel(filename, index=False)
         print(f"📁 Excel 檔案已產生：{filename}")
 
-        # 建立郵件
-        msg = MIMEMultipart()
-        msg["From"] = EMAIL_SENDER
-        msg["To"] = EMAIL_RECEIVER
-        msg["Subject"] = f"📈 VCP 每日報告 {datetime.now().strftime('%Y-%m-%d')}"
-        body = f"今日共掃描 {total_scanned} 檔，符合條件 {len(results)} 檔。\n詳細請見附件。"
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-
-        # 附加檔案
+        # 讀取檔案並轉為 base64
         with open(filename, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={filename}")
-        msg.attach(part)
+            file_content = f.read()
+        attachment = {
+            "filename": filename,
+            "content": list(file_content)  # Resend 附件要求 content 為 bytes list
+        }
 
-        # 清理 SMTP 伺服器位址（移除 https:// 或 http://）
-        smtp_server = EMAIL_SMTP_SERVER
-        if smtp_server.startswith("https://"):
-            smtp_server = smtp_server.replace("https://", "")
-        elif smtp_server.startswith("http://"):
-            smtp_server = smtp_server.replace("http://", "")
-        smtp_server = smtp_server.rstrip("/")
+        # 寄送郵件
+        params = {
+            "from": f"VCP 掃描器 <{EMAIL_SENDER}>",
+            "to": [EMAIL_RECEIVER],
+            "subject": f"📈 VCP 每日報告 {datetime.now().strftime('%Y-%m-%d')}",
+            "html": f"<p>今日共掃描 {total_scanned} 檔，符合條件 {len(results)} 檔。<br>詳細請見附件。</p>",
+            "attachments": [attachment]
+        }
+        response = resend.Emails.send(params)
+        print(f"✅ Email 已寄送至 {EMAIL_RECEIVER}，Resend ID: {response['id']}")
 
-        print(f"📧 嘗試寄送 Email：{EMAIL_SENDER} -> {EMAIL_RECEIVER} via {smtp_server}:{EMAIL_SMTP_PORT}")
-
-        # 根據連接埠選擇加密方式
-        if EMAIL_SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(smtp_server, EMAIL_SMTP_PORT, timeout=10)
-        else:
-            server = smtplib.SMTP(smtp_server, EMAIL_SMTP_PORT, timeout=10)
-            server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        server.quit()
-        print(f"✅ Email 已寄送至 {EMAIL_RECEIVER}")
-
-    except smtplib.SMTPAuthenticationError:
-        print("❌ SMTP 認證失敗！請檢查 EMAIL_PASSWORD 是否為「應用程式密碼」")
-    except smtplib.SMTPConnectError:
-        print(f"❌ 無法連線到 SMTP 伺服器 {smtp_server}:{EMAIL_SMTP_PORT}")
     except Exception as e:
         print(f"❌ Email 寄送失敗：{type(e).__name__} - {str(e)}")
 
