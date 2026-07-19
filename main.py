@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import threading
 from datetime import datetime, timedelta
 from collections import deque
@@ -8,7 +9,7 @@ import pandas as pd
 import numpy as np
 import requests
 import resend
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from FinMind.data import DataLoader
@@ -27,13 +28,24 @@ FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-
-# Email 設定 (保留 EMAIL_SENDER, EMAIL_RECEIVER 用於寄送)
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER", "")
 
+# 黑名單檔案 (Render 重啟會消失，可改用持久化磁碟)
+BLACKLIST_FILE = "blacklist.json"
+if os.path.exists(BLACKLIST_FILE):
+    with open(BLACKLIST_FILE, "r") as f:
+        blacklist = json.load(f)
+else:
+    blacklist = {}
+
+def save_blacklist():
+    with open(BLACKLIST_FILE, "w") as f:
+        json.dump(blacklist, f)
+
 # ========== 全域變數 ==========
 scan_results = []
+trade_signals = []
 any_scan_running = False
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
@@ -53,6 +65,7 @@ def get_api():
         _api_instance.login_by_token(FINMIND_TOKEN)
     return _api_instance
 
+# ========== 輔助函數 ==========
 def send_telegram_msg(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ 缺少 Telegram 設定")
@@ -64,7 +77,6 @@ def send_telegram_msg(message):
         print(f"Telegram 發送失敗：{e}")
 
 def send_email_report(results, total_scanned):
-    """使用 Resend API 寄送 Excel 報告（雙工作表）"""
     if not RESEND_API_KEY:
         print("⚠️ 未設定 RESEND_API_KEY，跳過 Email 寄送")
         return
@@ -78,10 +90,9 @@ def send_email_report(results, total_scanned):
     resend.api_key = RESEND_API_KEY
 
     try:
-        # 所有漏斗候選
-        df_all = pd.DataFrame(results)
-        df_all = df_all.sort_values("rs_score", ascending=False)
-        df_all = df_all.rename(columns={
+        df = pd.DataFrame(results)
+        df = df.sort_values("rs_score", ascending=False)
+        df = df.rename(columns={
             "symbol": "代號", "price": "股價", "change_pct": "漲跌幅%",
             "rs_score": "RS", "contractions": "收縮次數",
             "volume_ratio": "量比", "quality": "品質",
@@ -89,17 +100,15 @@ def send_email_report(results, total_scanned):
         })
 
         # 最終進場訊號（buy_signal == True）
-        df_buy = df_all[df_all["進場訊號"] == True].copy()
+        df_buy = df[df["進場訊號"] == True].copy()
 
-        # 建立 Excel，包含兩個工作表
         filename = f"VCP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            df_all.to_excel(writer, sheet_name="全部漏斗候選", index=False)
+            df.to_excel(writer, sheet_name="全部漏斗候選", index=False)
             df_buy.to_excel(writer, sheet_name="最終進場訊號", index=False)
 
-        print(f"📁 Excel 檔案已產生：{filename} (全部 {len(df_all)} 檔，進場 {len(df_buy)} 檔)")
+        print(f"📁 Excel 檔案已產生：{filename} (全部 {len(df)} 檔，進場 {len(df_buy)} 檔)")
 
-        # 讀取檔案並轉為附件
         with open(filename, "rb") as f:
             file_content = f.read()
 
@@ -112,7 +121,7 @@ def send_email_report(results, total_scanned):
             "from": f"VCP 掃描器 <{EMAIL_SENDER}>",
             "to": [EMAIL_RECEIVER],
             "subject": f"📈 VCP 每日報告 {datetime.now().strftime('%Y-%m-%d')}",
-            "html": f"<p>今日共掃描 {total_scanned} 檔，符合漏斗條件 {len(df_all)} 檔，其中最終進場訊號 {len(df_buy)} 檔。<br>詳細請見附件。</p>",
+            "html": f"<p>今日共掃描 {total_scanned} 檔，符合漏斗條件 {len(df)} 檔，其中最終進場訊號 {len(df_buy)} 檔。<br>詳細請見附件。</p>",
             "attachments": [attachment]
         }
         response = resend.Emails.send(params)
@@ -154,7 +163,7 @@ def _wait_for_slot():
                 wait = oldest + REQUEST_WINDOW - now + 0.1
         time.sleep(wait)
 
-# 股票清單快取 (含重試)
+# ========== 股票清單、下載 ==========
 _stock_ids_cache = {"ids": [], "ts": 0}
 def get_filtered_stock_ids():
     now = time.time()
@@ -182,6 +191,7 @@ def get_filtered_stock_ids():
             else:
                 print("🚨 無法取得股票清單，掃描終止")
                 return []
+    return []
 
 def fetch_daily(sid, start_date, end_date):
     _wait_for_slot()
@@ -204,6 +214,22 @@ def _get_col(data, *names):
         if n in data.columns:
             return data[n]
     return None
+
+# ========== 加權指數檢查 (Step1) ==========
+def get_market_status():
+    """回傳加權指數是否在 20MA 之上 (True/False) 以及收盤價"""
+    try:
+        df = fetch_daily("IX0001", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
+                         datetime.today().strftime("%Y-%m-%d"))
+        if df is None or len(df) < 20:
+            return None, None
+        close = df["close"]
+        ma20 = close.rolling(20).mean()
+        last = close.iloc[-1]
+        return last > ma20.iloc[-1], round(last, 2)
+    except Exception as e:
+        print(f"加權指數檢查失敗：{e}")
+        return None, None
 
 # ========== 第一層：Minervini（距52週高點90%以內） ==========
 def minervini_check(data):
@@ -294,14 +320,13 @@ def vcp_math_check(data):
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
-        # 品質評分
         qs = 0
         if contractions >= 3: qs += 1
         if vol_ratio >= 1.8: qs += 1
         if rs >= 93: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
-        # ── 新增：判斷進場訊號（監看邏輯） ──
+        # 進場訊號（前端監看邏輯）
         ma50 = close.rolling(50).mean().iloc[-1]
         ma150 = close.rolling(150).mean().iloc[-1]
         ma200 = close.rolling(200).mean().iloc[-1]
@@ -319,27 +344,45 @@ def vcp_math_check(data):
             "contractions": contractions,
             "volume_ratio": round(float(vol_ratio), 2),
             "quality": quality,
-            "buy_signal": buy_signal    # 新增欄位
+            "buy_signal": buy_signal
         }
     except Exception as e:
         print(f"  VCP error: {e}")
         return None
 
-# ========== 除錯版函數（同步更新） ==========
-# (minervini_check_with_debug, vcp_math_check_with_debug 與正式版一致，此處略，你可自行保留)
+# ========== 新交易過濾器 (Step 2-5) ==========
+def apply_trade_filters(candidates):
+    market_bull, market_price = get_market_status()
+    filtered = []
+    for c in candidates:
+        # Step2: 基本訊號
+        if not c.get("buy_signal") or c.get("quality") != "A" or c.get("rs_score", 0) < 90:
+            continue
 
-def build_report(total, results):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if not results:
-        return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
-    sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-    msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
-    for i, c in enumerate(sorted_results[:15], 1):
-        symbol = c['symbol']
-        yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
-        msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
-    return msg
+        # Step3: 量比過濾
+        vol_ratio = c.get("volume_ratio", 0)
+        if vol_ratio >= 2.0:
+            continue
 
+        # Step4: 收縮次數過濾
+        contractions = c.get("contractions", 0)
+        if contractions < 18:
+            continue
+        if 15 <= contractions <= 17:
+            continue
+
+        # Step5: 黑名單檢查
+        symbol = c.get("symbol", "")
+        if symbol in blacklist:
+            past_status = blacklist[symbol]
+            if past_status == -1:
+                if vol_ratio >= 1.5 or contractions < 20:
+                    continue
+
+        c["market_bull"] = market_bull
+        c["market_price"] = market_price
+        filtered.append(c)
+    return filtered
 # ========== 掃描執行器 ==========
 def _run_scan(scanner_func):
     global any_scan_running
@@ -360,7 +403,7 @@ def _run_scan(scanner_func):
 _manual_scan_status = {"running": False, "total": 0, "done": 0, "results": []}
 
 def manual_scanner():
-    global _manual_scan_status, scan_results
+    global _manual_scan_status, scan_results, trade_signals
     _manual_scan_status["running"] = True
     _manual_scan_status["done"] = 0
     _manual_scan_status["results"] = []
@@ -388,13 +431,14 @@ def manual_scanner():
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    # 掃描完成後寄送 Email
-    send_email_report(_manual_scan_status["results"], total)
-    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
-
+    # 應用交易過濾
+    trade_signals = apply_trade_filters(scan_results)
+    # 寄送 Email
+    send_email_report(scan_results, total)
+    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
 # ========== 夜間背景掃描 ==========
 def background_scanner():
-    global scan_results, last_report_msg, _manual_scan_status
+    global scan_results, last_report_msg, _manual_scan_status, trade_signals
     stocks = get_filtered_stock_ids()
     if not stocks:
         print("❌ 無股票清單，夜間掃描終止")
@@ -421,8 +465,22 @@ def background_scanner():
     _manual_scan_status["results"] = local_results
     last_report_msg = build_report(total, scan_results)
     send_telegram_msg(last_report_msg)
+    # 應用交易過濾
+    trade_signals = apply_trade_filters(scan_results)
     send_email_report(scan_results, total)
-    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔")
+    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
+
+def build_report(total, results):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if not results:
+        return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
+    sorted_results = sorted(results, key=lambda x: -x["rs_score"])
+    msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
+    for i, c in enumerate(sorted_results[:15], 1):
+        symbol = c['symbol']
+        yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
+        msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
+    return msg
 
 # ========== API 端點 ==========
 @app.get("/start_scan_async")
@@ -471,6 +529,7 @@ def scan_status():
         return {"running": False, "total": 0, "done": 0, "candidates": []}
     except Exception as e:
         return {"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []}
+
 
 @app.get("/send_report")
 def send_report():
@@ -544,14 +603,48 @@ def full_report():
     html += "</table></body></html>"
     return HTMLResponse(content=html)
 
-# 新增：最終精選端點（只回傳 buy_signal == True）
 @app.get("/final_candidates")
 def final_candidates():
     results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
     if not results:
         return []
     return [c for c in results if c.get("buy_signal")]
+@app.get("/trade_signals")
+def get_trade_signals():
+    market_bull, market_price = get_market_status()
+    return {
+        "market_bull": market_bull,
+        "market_price": market_price,
+        "suggestion": "暫停進場，或只投 1/3 資金" if not market_bull else "可正常進場",
+        "candidates": trade_signals,
+        "entry_tips": [
+            "選項 A: 訊號當天尾盤（突破確認）",
+            "選項 B: 隔天開盤（觀察隔夜美股）",
+            "選項 C: 盤中量比未飆高時（最佳）"
+        ],
+        "exit_tips": [
+            "停利：持有 3-5 天後評估，趨緩即出",
+            "停損：跌破入場當天最低價 -3%",
+            "時間停損：5 天未達 +3% 即出場"
+        ]
+    }
 
+@app.get("/blacklist")
+def get_blacklist():
+    return blacklist
+
+@app.post("/blacklist/add")
+def add_blacklist(symbol: str, status: int = -1):
+    blacklist[symbol] = status
+    save_blacklist()
+    return {"message": "ok"}
+
+@app.get("/market_status")
+def market_status():
+    bull, price = get_market_status()
+    return {"bull": bull, "price": price}
+
+# ========== 啟動 ==========
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
