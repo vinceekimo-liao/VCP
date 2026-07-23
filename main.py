@@ -45,7 +45,7 @@ def save_blacklist():
 
 # ========== 全域變數 ==========
 scan_results = []
-trade_signals = []          # 確保此變數存在
+trade_signals = []
 any_scan_running = False
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
@@ -130,6 +130,7 @@ def send_email_report(results, total_scanned):
         print(f"❌ Email 寄送失敗：{type(e).__name__} - {str(e)}")
 
 def convert_numpy(obj):
+    """將 numpy 型別遞迴轉換為 Python 原生型別，確保可以 JSON 序列化"""
     if isinstance(obj, dict):
         return {k: convert_numpy(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -220,13 +221,17 @@ def get_market_status():
         df = fetch_daily("IX0001", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
                          datetime.today().strftime("%Y-%m-%d"))
         if df is None or len(df) < 20:
+            print("⚠️ 無法取得加權指數資料，回傳 None")
             return None, None
         close = df["close"]
         ma20 = close.rolling(20).mean()
         last = close.iloc[-1]
-        return last > ma20.iloc[-1], round(last, 2)
+        market_bull = last > ma20.iloc[-1]
+        market_price = round(last, 2)
+        print(f"📊 加權指數：{market_price}，{'站穩' if market_bull else '跌破'} 20MA")
+        return market_bull, market_price
     except Exception as e:
-        print(f"加權指數檢查失敗：{e}")
+        print(f"❌ 加權指數檢查失敗：{e}")
         return None, None
 
 # ========== 第一層：Minervini ==========
@@ -355,11 +360,9 @@ def apply_trade_filters(candidates):
         vol_ratio = c.get("volume_ratio", 0)
         contractions = c.get("contractions", 0)
 
-        # 黃金條件
         if vol_ratio >= 1.5 or contractions < 17:
             continue
 
-        # 黑名單檢查
         symbol = c.get("symbol", "")
         if symbol in blacklist:
             past_status = blacklist[symbol]
@@ -421,7 +424,6 @@ def manual_scanner():
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
-    # 應用交易過濾
     trade_signals = apply_trade_filters(scan_results)
     send_email_report(scan_results, total)
     print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
@@ -471,53 +473,53 @@ def build_report(total, results):
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== API 端點 ==========
+# ========== API 端點（所有 JSON 回傳皆透過 convert_numpy） ==========
 @app.get("/start_scan_async")
 def start_scan_async():
     global any_scan_running
     if any_scan_running:
-        return {"status": "already running"}
+        return convert_numpy({"status": "already running"})
     thread = threading.Thread(target=_run_scan, args=(manual_scanner,))
     thread.start()
-    return {"status": "started"}
+    return convert_numpy({"status": "started"})
 
 @app.get("/start_scan")
 def start_scan():
     global any_scan_running
     if any_scan_running:
-        return {"status": "already running"}
+        return convert_numpy({"status": "already running"})
     thread = threading.Thread(target=_run_scan, args=(background_scanner,))
     thread.start()
-    return {"status": "started"}
+    return convert_numpy({"status": "started"})
 
 @app.get("/scan_status")
 def scan_status():
     try:
         if _manual_scan_status["running"]:
-            return {
+            return convert_numpy({
                 "running": True,
                 "total": _manual_scan_status["total"],
                 "done": _manual_scan_status["done"],
                 "candidates": []
-            }
+            })
         if _manual_scan_status["results"]:
-            return {
+            return convert_numpy({
                 "running": False,
                 "total": _manual_scan_status["total"],
                 "done": _manual_scan_status["done"],
                 "candidates": _manual_scan_status["results"]
-            }
+            })
         with scan_lock:
             if scan_results:
-                return {
+                return convert_numpy({
                     "running": False,
                     "total": len(get_filtered_stock_ids()),
                     "done": len(scan_results),
                     "candidates": scan_results
-                }
-        return {"running": False, "total": 0, "done": 0, "candidates": []}
+                })
+        return convert_numpy({"running": False, "total": 0, "done": 0, "candidates": []})
     except Exception as e:
-        return {"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []}
+        return convert_numpy({"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []})
 
 @app.get("/send_report")
 def send_report():
@@ -532,23 +534,22 @@ def send_report():
     last_report_msg = msg
     send_telegram_msg(msg)
     send_email_report(current, total)
-    return {"status": "report sent"}
+    return convert_numpy({"status": "report sent"})
 
 @app.get("/latest_report")
 def latest_report():
     global last_report_msg
-    return {"report": last_report_msg}
+    return convert_numpy({"report": last_report_msg})
 
 @app.get("/health")
 def health():
     with _request_lock:
         pending = len(_request_times)
-    return {"status": "ok", "scanning": any_scan_running, "requests_last_hour": pending}
+    return convert_numpy({"status": "ok", "scanning": any_scan_running, "requests_last_hour": pending})
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    # 保留診斷，此處略
-    return {"status": "ok"}
+    return convert_numpy({"status": "ok"})
 
 @app.get("/full_report", response_class=HTMLResponse)
 def full_report():
@@ -576,17 +577,15 @@ def full_report():
 
 @app.get("/final_candidates")
 def final_candidates():
-    """回傳 buy_signal == True 的股票（來自最近一次掃描）"""
     results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
     if not results:
-        return []
-    return [c for c in results if c.get("buy_signal")]
+        return convert_numpy([])
+    return convert_numpy([c for c in results if c.get("buy_signal")])
 
 @app.get("/trade_signals")
 def get_trade_signals():
-    """回傳經過 Step 3-4 過濾後的最終交易訊號"""
     market_bull, market_price = get_market_status()
-    return {
+    return convert_numpy({
         "market_bull": market_bull,
         "market_price": market_price,
         "suggestion": "暫停進場，或只投 1/3 資金" if not market_bull else "可正常進場",
@@ -603,22 +602,22 @@ def get_trade_signals():
             "停損：-3% 或跌破篩選日最低價",
             "時間停損：5 天未達 +3% 即出場"
         ]
-    }
+    })
 
 @app.get("/blacklist")
 def get_blacklist():
-    return blacklist
+    return convert_numpy(blacklist)
 
 @app.post("/blacklist/add")
 def add_blacklist(symbol: str, status: int = -1):
     blacklist[symbol] = status
     save_blacklist()
-    return {"message": "ok"}
+    return convert_numpy({"message": "ok"})
 
 @app.get("/market_status")
 def market_status():
     bull, price = get_market_status()
-    return {"bull": bull, "price": price}
+    return convert_numpy({"bull": bull, "price": price})
 
 if __name__ == "__main__":
     import uvicorn
