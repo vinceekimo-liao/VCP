@@ -45,12 +45,12 @@ def save_blacklist():
 
 # ========== 全域變數 ==========
 scan_results = []
-trade_signals = []
+trade_signals = []          # 確保此變數存在
 any_scan_running = False
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
 
-# 請求頻率控制 ── 滑動窗口 (每小時 500 次) + 最小間隔 7 秒
+# 請求頻率控制
 _request_times = deque()
 REQUEST_LIMIT = 500
 REQUEST_WINDOW = 3600
@@ -216,7 +216,6 @@ def _get_col(data, *names):
 
 # ========== 加權指數檢查 ==========
 def get_market_status():
-    """回傳加權指數是否在 20MA 之上 (True/False) 以及收盤價"""
     try:
         df = fetch_daily("IX0001", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
                          datetime.today().strftime("%Y-%m-%d"))
@@ -230,7 +229,7 @@ def get_market_status():
         print(f"加權指數檢查失敗：{e}")
         return None, None
 
-# ========== 第一層：Minervini（距52週高點90%以內） ==========
+# ========== 第一層：Minervini ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -256,7 +255,7 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（收緊版 + 進場訊號判斷） ==========
+# ========== 第二層：VCP（收緊版 + 進場訊號） ==========
 def vcp_math_check(data):
     if data is None or len(data) < 60:
         return None
@@ -306,7 +305,6 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # ── 收緊條件 ──
         if rs < 90:
             return None
 
@@ -325,7 +323,6 @@ def vcp_math_check(data):
         if rs >= 93: qs += 1
         quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
 
-        # 進場訊號
         ma50 = close.rolling(50).mean().iloc[-1]
         ma150 = close.rolling(150).mean().iloc[-1]
         ma200 = close.rolling(200).mean().iloc[-1]
@@ -355,20 +352,18 @@ def apply_trade_filters(candidates):
     market_bull, market_price = get_market_status()
     filtered = []
     for c in candidates:
-        # Step 3: 黃金條件
         vol_ratio = c.get("volume_ratio", 0)
         contractions = c.get("contractions", 0)
 
-        # 量比 < 1.5 且 收縮 >= 17
+        # 黃金條件
         if vol_ratio >= 1.5 or contractions < 17:
             continue
 
-        # Step 4: 黑名單檢查
+        # 黑名單檢查
         symbol = c.get("symbol", "")
         if symbol in blacklist:
             past_status = blacklist[symbol]
             if past_status == -1:
-                # 提高門檻：量比 < 1.5 且 收縮 >= 20
                 if vol_ratio >= 1.5 or contractions < 20:
                     continue
 
@@ -376,7 +371,6 @@ def apply_trade_filters(candidates):
         c["market_price"] = market_price
         filtered.append(c)
 
-    # 若無符合 → 空手觀望（不勉強進場）
     return filtered
 
 # ========== 掃描執行器 ==========
@@ -429,7 +423,6 @@ def manual_scanner():
         scan_results = _manual_scan_status["results"]
     # 應用交易過濾
     trade_signals = apply_trade_filters(scan_results)
-    # 寄送 Email
     send_email_report(scan_results, total)
     print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
 
@@ -462,7 +455,6 @@ def background_scanner():
     _manual_scan_status["results"] = local_results
     last_report_msg = build_report(total, scan_results)
     send_telegram_msg(last_report_msg)
-    # 應用交易過濾
     trade_signals = apply_trade_filters(scan_results)
     send_email_report(scan_results, total)
     print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
@@ -555,7 +547,7 @@ def health():
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    # 保留原有診斷，此處略
+    # 保留診斷，此處略
     return {"status": "ok"}
 
 @app.get("/full_report", response_class=HTMLResponse)
@@ -584,6 +576,7 @@ def full_report():
 
 @app.get("/final_candidates")
 def final_candidates():
+    """回傳 buy_signal == True 的股票（來自最近一次掃描）"""
     results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
     if not results:
         return []
@@ -591,6 +584,7 @@ def final_candidates():
 
 @app.get("/trade_signals")
 def get_trade_signals():
+    """回傳經過 Step 3-4 過濾後的最終交易訊號"""
     market_bull, market_price = get_market_status()
     return {
         "market_bull": market_bull,
