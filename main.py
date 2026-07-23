@@ -130,7 +130,7 @@ def send_email_report(results, total_scanned):
         print(f"❌ Email 寄送失敗：{type(e).__name__} - {str(e)}")
 
 def convert_numpy(obj):
-    """將 numpy 型別遞迴轉換為 Python 原生型別，確保可以 JSON 序列化"""
+    """遞迴將 numpy 型別轉為 Python 原生型別，確保 JSON 可序列化"""
     if isinstance(obj, dict):
         return {k: convert_numpy(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -143,6 +143,8 @@ def convert_numpy(obj):
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
     return obj
 
 # ========== 無死鎖限流 ==========
@@ -215,23 +217,21 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 加權指數檢查 ==========
+# ========== 加權指數檢查 (使用 TAIEX) ==========
 def get_market_status():
+    """回傳加權指數是否在 20MA 之上 (True/False) 以及收盤價"""
     try:
-        df = fetch_daily("IX0001", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
+        # FinMind 中 TAIEX 的代號就是 "TAIEX"
+        df = fetch_daily("TAIEX", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
                          datetime.today().strftime("%Y-%m-%d"))
         if df is None or len(df) < 20:
-            print("⚠️ 無法取得加權指數資料，回傳 None")
             return None, None
         close = df["close"]
         ma20 = close.rolling(20).mean()
         last = close.iloc[-1]
-        market_bull = last > ma20.iloc[-1]
-        market_price = round(last, 2)
-        print(f"📊 加權指數：{market_price}，{'站穩' if market_bull else '跌破'} 20MA")
-        return market_bull, market_price
+        return bool(last > ma20.iloc[-1]), round(float(last), 2)
     except Exception as e:
-        print(f"❌ 加權指數檢查失敗：{e}")
+        print(f"加權指數檢查失敗：{e}")
         return None, None
 
 # ========== 第一層：Minervini ==========
@@ -345,7 +345,7 @@ def vcp_math_check(data):
             "contractions": contractions,
             "volume_ratio": round(float(vol_ratio), 2),
             "quality": quality,
-            "buy_signal": buy_signal
+            "buy_signal": bool(buy_signal)
         }
     except Exception as e:
         print(f"  VCP error: {e}")
@@ -473,24 +473,24 @@ def build_report(total, results):
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== API 端點（所有 JSON 回傳皆透過 convert_numpy） ==========
+# ========== API 端點（所有回傳皆經過 convert_numpy） ==========
 @app.get("/start_scan_async")
 def start_scan_async():
     global any_scan_running
     if any_scan_running:
-        return convert_numpy({"status": "already running"})
+        return {"status": "already running"}
     thread = threading.Thread(target=_run_scan, args=(manual_scanner,))
     thread.start()
-    return convert_numpy({"status": "started"})
+    return {"status": "started"}
 
 @app.get("/start_scan")
 def start_scan():
     global any_scan_running
     if any_scan_running:
-        return convert_numpy({"status": "already running"})
+        return {"status": "already running"}
     thread = threading.Thread(target=_run_scan, args=(background_scanner,))
     thread.start()
-    return convert_numpy({"status": "started"})
+    return {"status": "started"}
 
 @app.get("/scan_status")
 def scan_status():
@@ -517,9 +517,9 @@ def scan_status():
                     "done": len(scan_results),
                     "candidates": scan_results
                 })
-        return convert_numpy({"running": False, "total": 0, "done": 0, "candidates": []})
+        return {"running": False, "total": 0, "done": 0, "candidates": []}
     except Exception as e:
-        return convert_numpy({"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []})
+        return {"error": str(e), "running": False, "total": 0, "done": 0, "candidates": []}
 
 @app.get("/send_report")
 def send_report():
@@ -534,22 +534,22 @@ def send_report():
     last_report_msg = msg
     send_telegram_msg(msg)
     send_email_report(current, total)
-    return convert_numpy({"status": "report sent"})
+    return {"status": "report sent"}
 
 @app.get("/latest_report")
 def latest_report():
     global last_report_msg
-    return convert_numpy({"report": last_report_msg})
+    return {"report": last_report_msg}
 
 @app.get("/health")
 def health():
     with _request_lock:
         pending = len(_request_times)
-    return convert_numpy({"status": "ok", "scanning": any_scan_running, "requests_last_hour": pending})
+    return {"status": "ok", "scanning": any_scan_running, "requests_last_hour": pending}
 
 @app.get("/debug_scan")
 def debug_scan(symbol: str = "3008"):
-    return convert_numpy({"status": "ok"})
+    return {"status": "ok"}
 
 @app.get("/full_report", response_class=HTMLResponse)
 def full_report():
@@ -579,7 +579,7 @@ def full_report():
 def final_candidates():
     results = _manual_scan_status["results"] if _manual_scan_status["results"] else scan_results
     if not results:
-        return convert_numpy([])
+        return []
     return convert_numpy([c for c in results if c.get("buy_signal")])
 
 @app.get("/trade_signals")
@@ -606,18 +606,18 @@ def get_trade_signals():
 
 @app.get("/blacklist")
 def get_blacklist():
-    return convert_numpy(blacklist)
+    return blacklist
 
 @app.post("/blacklist/add")
 def add_blacklist(symbol: str, status: int = -1):
     blacklist[symbol] = status
     save_blacklist()
-    return convert_numpy({"message": "ok"})
+    return {"message": "ok"}
 
 @app.get("/market_status")
 def market_status():
     bull, price = get_market_status()
-    return convert_numpy({"bull": bull, "price": price})
+    return {"bull": bull, "price": price}
 
 if __name__ == "__main__":
     import uvicorn
