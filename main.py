@@ -232,123 +232,134 @@ def get_market_status():
         print(f"加權指數檢查失敗：{e}")
         return None, None
 
-# ========== 第一層：Minervini（加入 MA50 條件） ==========
+# ========== 第一層：Minervini 完整 Stage 2 趨勢範本 ==========
 def minervini_check(data):
-    if data is None or len(data) < 200:
+    if data is None or len(data) < 250:
         return False
+        
     close = _get_col(data, "close", "Close")
     high  = _get_col(data, "max", "high", "High")
-    if close is None or high is None:
+    low   = _get_col(data, "min", "low", "Low")
+    
+    if close is None or high is None or low is None:
         return False
+        
     close = pd.to_numeric(close, errors='coerce').dropna()
     high  = pd.to_numeric(high,  errors='coerce').dropna()
-    if len(close) < 200 or len(high) < 200:
+    low   = pd.to_numeric(low,   errors='coerce').dropna()
+    
+    if len(close) < 250 or len(high) < 250 or len(low) < 250:
         return False
+
     try:
         ma50  = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
-        last  = close.iloc[-1]
-        # 加入 MA50 條件：收盤價必須在 MA50 之上
-        if not (last > ma50.iloc[-1] and last > ma150.iloc[-1] and last > ma200.iloc[-1]):
+        
+        c_last = close.iloc[-1]
+        m50_last  = ma50.iloc[-1]
+        m150_last = ma150.iloc[-1]
+        m200_last = ma200.iloc[-1]
+        
+        # 1. 均線多頭排列
+        if not (c_last > m50_last and m50_last > m150_last and m150_last > m200_last):
             return False
-        if len(high) >= 200:
-            high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
-            if pd.notna(high_52w) and last < high_52w * 0.90:
-                return False
+            
+        # 2. 200MA 向上
+        if m200_last <= ma200.iloc[-20]:
+            return False
+            
+        # 3. 52 週高低點
+        high_52w = high.tail(250).max()
+        low_52w  = low.tail(250).min()
+        
+        if c_last < low_52w * 1.30:
+            return False
+            
+        if c_last < high_52w * 0.75:
+            return False
+            
         return True
-    except:
+    except Exception as e:
         return False
 
-# ========== 第二層：VCP（回測優化版） ==========
+# ========== 第二層：VCP 籌碼乾涸與動能爆量檢查 ==========
 def vcp_math_check(data):
-    """回測優化版 VCP 檢查：放寬收縮條件、RS=99 加分、量比黃金區間"""
-    if data is None or len(data) < 60:
+    if data is None or len(data) < 120:
         return None
 
-    close  = _get_col(data, "close", "Close")
-    volume = _get_col(data, "Trading_Volume", "volume", "Volume")
-    if close is None or volume is None:
+    close  = pd.to_numeric(_get_col(data, "close", "Close"), errors='coerce')
+    high   = pd.to_numeric(_get_col(data, "max", "high", "High"), errors='coerce')
+    low    = pd.to_numeric(_get_col(data, "min", "low", "Low"), errors='coerce')
+    volume = pd.to_numeric(_get_col(data, "Trading_Volume", "volume", "Volume"), errors='coerce')
+
+    df_clean = pd.DataFrame({"close": close, "high": high, "low": low, "volume": volume}).dropna()
+    if len(df_clean) < 120:
         return None
 
-    close  = pd.to_numeric(close, errors='coerce')
-    volume = pd.to_numeric(volume, errors='coerce')
-
-    df_clean = pd.DataFrame({"close": close, "volume": volume}).dropna()
-    if len(df_clean) < 60:
-        return None
-
-    close  = df_clean["close"]
-    volume = df_clean["volume"]
+    c = df_clean["close"]
+    h = df_clean["high"]
+    l = df_clean["low"]
+    v = df_clean["volume"]
 
     try:
-        vol_ma_20 = volume.rolling(20).mean()
-        recent_vol = volume.iloc[-3:].mean()
-        if pd.isna(vol_ma_20.iloc[-1]) or vol_ma_20.iloc[-1] == 0:
+        # 1. 量比
+        vol_ma20 = v.rolling(20).mean()
+        if pd.isna(vol_ma20.iloc[-1]) or vol_ma20.iloc[-1] == 0:
             return None
-        vol_ratio = recent_vol / vol_ma_20.iloc[-1]
+        vol_ratio = v.iloc[-1] / vol_ma20.iloc[-1]
 
-        # 計算收縮次數
-        contractions = 0
-        in_pullback = False
-        for i in range(5, len(close)):
-            try:
-                pc = (close.iloc[i] - close.iloc[i-5]) / close.iloc[i-5] * 100
-                vc = (volume.iloc[i] - volume.iloc[i-5]) / volume.iloc[i-5] * 100 if volume.iloc[i-5] != 0 else 0
-            except:
-                continue
-            if not in_pullback and pc < -2 and vc < -15:
-                in_pullback = True
-            if in_pullback and pc > 0:
-                contractions += 1
-                in_pullback = False
+        # 2. VDU
+        vdu_flag = v.iloc[-4:-1].mean() < (vol_ma20.iloc[-1] * 0.85)
 
-        today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
+        # 3. VCP 收縮
+        range_t1 = (h.iloc[-40:-20].max() - l.iloc[-40:-20].min()) / l.iloc[-40:-20].min()
+        range_t2 = (h.iloc[-20:-1].max() - l.iloc[-20:-1].min()) / l.iloc[-20:-1].min()
+        vcp_contracting = range_t1 > range_t2
 
-        # RS 計算
-        rs_lookback = min(60, len(close))
-        past_close = close.iloc[-rs_lookback]
+        contractions = 3 if (vcp_contracting and vdu_flag) else (2 if vcp_contracting else 1)
+
+        # 4. 樞紐突破
+        today_change = ((c.iloc[-1] - c.iloc[-2]) / c.iloc[-2] * 100) if len(c) >= 2 else 0
+        pivot_high = h.iloc[-20:-1].max()
+        is_pivot_breakout = c.iloc[-1] >= pivot_high * 0.99
+
+        # 5. RS
+        rs_lookback = min(60, len(c))
+        past_close = c.iloc[-rs_lookback]
         if past_close <= 0:
             return None
-        rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
+        rs_raw = 50 + (c.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        # RS 門檻從 90 放寬到 85
-        if rs < 85:
+        if rs < 85 or vol_ratio < 1.5:
             return None
 
-        # 放寬收縮條件（根據回測，收縮 5-20 都有不錯表現）
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.5)
-        cond2 = (contractions >= 1) and (vol_ratio >= 2.0)
-        cond3 = (today_change > 5.0) and (vol_ratio > 2.5)
-        cond4 = (contractions >= 7) and (vol_ratio >= 0.8) and (rs >= 95)
-        cond5 = (contractions >= 5) and (vol_ratio >= 0.9) and (rs >= 97)
-
-        if not (cond1 or cond2 or cond3 or cond4 or cond5):
-            return None
-
-        # 品質評分：RS=99 額外加分、量比黃金區間加分
+        # 6. 品質評分
         qs = 0
-        if contractions >= 3:
+        if 1.8 <= vol_ratio <= 3.0:
+            qs += 2
+        elif vol_ratio > 3.0:
             qs += 1
-        if 1.5 <= vol_ratio <= 2.5:
-            qs += 1      # 黃金量比區間
-        elif vol_ratio > 2.5:
-            qs += 0      # 過高量比不加分（可能是出貨）
-        if rs >= 99:
-            qs += 2      # RS=99 額外加分
-        elif rs >= 93:
+        if vdu_flag:
             qs += 1
-        quality = "A" if qs >= 3 else "B" if qs >= 2 else "C"
+        if vcp_contracting:
+            qs += 1
+        if rs >= 95:
+            qs += 1
 
-        # 進場訊號
-        ma50  = close.rolling(50).mean().iloc[-1]
-        ma150 = close.rolling(150).mean().iloc[-1]
-        ma200 = close.rolling(200).mean().iloc[-1]
-        last  = close.iloc[-1]
+        quality = "A" if qs >= 4 else "B" if qs >= 2 else "C"
+
+        # 7. 進場訊號
+        ma50  = c.rolling(50).mean().iloc[-1]
+        ma150 = c.rolling(150).mean().iloc[-1]
+        ma200 = c.rolling(200).mean().iloc[-1]
+        last  = c.iloc[-1]
+
         buy_signal = (
-            pd.notna(ma50) and pd.notna(ma150) and pd.notna(ma200) and
-            last > ma200 and last > ma150 and ma150 > ma200 and last > ma50 and vol_ratio >= 1.2
+            is_pivot_breakout and
+            vol_ratio >= 1.5 and
+            last > ma50 > ma150 > ma200
         )
 
         return {
@@ -358,62 +369,61 @@ def vcp_math_check(data):
             "rs_score": rs,
             "contractions": contractions,
             "volume_ratio": round(float(vol_ratio), 2),
+            "vdu": vdu_flag,
             "quality": quality,
             "buy_signal": bool(buy_signal),
-            "consecutive_days": 0,  # 預設值，由外部填入
+            "consecutive_days": 0,
         }
     except Exception as e:
         print(f"  VCP error: {e}")
         return None
 
-# ========== 新交易過濾器（回測優化版） ==========
+# ========== 第三層：大盤趨勢與風控交易過濾器 ==========
 def apply_trade_filters(candidates):
-    """使用回測驗證的黃金條件：量比 < 1.5 且收縮 >= 17，加入連續入選與量比區間偏好"""
     market_bull, market_price = get_market_status()
     filtered = []
+
     for c in candidates:
-        vol_ratio = c.get("volume_ratio", 0)
-        contractions = c.get("contractions", 0)
+        symbol = c.get("symbol", "")
+        if symbol in blacklist and blacklist[symbol] == -1:
+            continue
+
+        vol_ratio   = c.get("volume_ratio", 0)
+        rs_score    = c.get("rs_score", 0)
+        quality     = c.get("quality", "C")
+        buy_signal  = c.get("buy_signal", False)
         consecutive = c.get("consecutive_days", 0)
 
-        # 連續入選≥2天的股票，放寬條件
-        if consecutive >= 2:
-            if vol_ratio >= 1.3 and contractions >= 5 and c.get("rs_score", 0) >= 90:
-                c["market_bull"] = market_bull
-                c["market_price"] = market_price
-                filtered.append(c)
-                continue
+        if not buy_signal or rs_score < 85:
+            continue
 
-        # 黃金量比區間 1.5-2.5，表現最佳
-        if 1.5 <= vol_ratio <= 2.5:
-            if contractions >= 4 and c.get("rs_score", 0) >= 90:
-                c["market_bull"] = market_bull
-                c["market_price"] = market_price
-                filtered.append(c)
-                continue
+        c["market_bull"] = market_bull
+        c["market_price"] = market_price
 
-        # 高量比 >3.0，可能是出貨，提高門檻
-        if vol_ratio > 3.0:
-            if contractions >= 10 and c.get("rs_score", 0) >= 95:
-                c["market_bull"] = market_bull
-                c["market_price"] = market_price
+        # 空頭防禦
+        if not market_bull:
+            if quality == "A" and vol_ratio >= 2.0 and rs_score >= 90:
+                c["filter_note"] = "空頭防禦性試探部位"
                 filtered.append(c)
-                continue
+            continue
 
-        # 標準 VCP 條件：量比 < 1.5 且收縮 >= 17（原有邏輯）
-        if vol_ratio < 1.5 and contractions >= 17:
-            c["market_bull"] = market_bull
-            c["market_price"] = market_price
+        # 多頭情境
+        if consecutive >= 2 and vol_ratio >= 1.3:
+            c["filter_note"] = "動能持續加碼股"
             filtered.append(c)
             continue
 
-        # 黑名單檢查
-        symbol = c.get("symbol", "")
-        if symbol in blacklist:
-            past_status = blacklist[symbol]
-            if past_status == -1:
-                if vol_ratio >= 1.5 or contractions < 20:
-                    continue
+        if 1.5 <= vol_ratio <= 3.0:
+            if quality in ["A", "B"] and rs_score >= 85:
+                c["filter_note"] = "黃金量比突破"
+                filtered.append(c)
+                continue
+
+        if vol_ratio > 3.0:
+            if rs_score >= 92 and quality in ["A", "B"]:
+                c["filter_note"] = "天量動能突破"
+                filtered.append(c)
+                continue
 
     return filtered
 
