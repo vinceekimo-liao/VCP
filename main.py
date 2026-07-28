@@ -217,11 +217,9 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 加權指數檢查 (使用 TAIEX) ==========
+# ========== 加權指數檢查 ==========
 def get_market_status():
-    """回傳加權指數是否在 20MA 之上 (True/False) 以及收盤價"""
     try:
-        # FinMind 中 TAIEX 的代號就是 "TAIEX"
         df = fetch_daily("TAIEX", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
                          datetime.today().strftime("%Y-%m-%d"))
         if df is None or len(df) < 20:
@@ -234,7 +232,7 @@ def get_market_status():
         print(f"加權指數檢查失敗：{e}")
         return None, None
 
-# ========== 第一層：Minervini ==========
+# ========== 第一層：Minervini（加入 MA50 條件） ==========
 def minervini_check(data):
     if data is None or len(data) < 200:
         return False
@@ -247,10 +245,12 @@ def minervini_check(data):
     if len(close) < 200 or len(high) < 200:
         return False
     try:
+        ma50  = close.rolling(50).mean()
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
         last  = close.iloc[-1]
-        if not (last > ma150.iloc[-1] and last > ma200.iloc[-1]):
+        # 加入 MA50 條件：收盤價必須在 MA50 之上
+        if not (last > ma50.iloc[-1] and last > ma150.iloc[-1] and last > ma200.iloc[-1]):
             return False
         if len(high) >= 200:
             high_52w = high.rolling(250, min_periods=1).max().iloc[-1]
@@ -260,8 +260,9 @@ def minervini_check(data):
     except:
         return False
 
-# ========== 第二層：VCP（收緊版 + 進場訊號） ==========
+# ========== 第二層：VCP（回測優化版） ==========
 def vcp_math_check(data):
+    """回測優化版 VCP 檢查：放寬收縮條件、RS=99 加分、量比黃金區間"""
     if data is None or len(data) < 60:
         return None
 
@@ -287,6 +288,7 @@ def vcp_math_check(data):
             return None
         vol_ratio = recent_vol / vol_ma_20.iloc[-1]
 
+        # 計算收縮次數
         contractions = 0
         in_pullback = False
         for i in range(5, len(close)):
@@ -303,6 +305,7 @@ def vcp_math_check(data):
 
         today_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
 
+        # RS 計算
         rs_lookback = min(60, len(close))
         past_close = close.iloc[-rs_lookback]
         if past_close <= 0:
@@ -310,28 +313,39 @@ def vcp_math_check(data):
         rs_raw = 50 + (close.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        if rs < 90:
+        # RS 門檻從 90 放寬到 85
+        if rs < 85:
             return None
 
-        cond1 = (contractions >= 2) and (vol_ratio >= 1.8)
-        cond2 = (contractions >= 1) and (vol_ratio >= 2.2)
-        cond3 = (today_change > 6.0) and (vol_ratio > 3.0)
-        cond4 = (contractions >= 11) and (vol_ratio >= 0.8) and (rs >= 99)
-        cond5 = (contractions >= 9) and (vol_ratio >= 0.9) and (rs >= 99)
+        # 放寬收縮條件（根據回測，收縮 5-20 都有不錯表現）
+        cond1 = (contractions >= 2) and (vol_ratio >= 1.5)
+        cond2 = (contractions >= 1) and (vol_ratio >= 2.0)
+        cond3 = (today_change > 5.0) and (vol_ratio > 2.5)
+        cond4 = (contractions >= 7) and (vol_ratio >= 0.8) and (rs >= 95)
+        cond5 = (contractions >= 5) and (vol_ratio >= 0.9) and (rs >= 97)
 
         if not (cond1 or cond2 or cond3 or cond4 or cond5):
             return None
 
+        # 品質評分：RS=99 額外加分、量比黃金區間加分
         qs = 0
-        if contractions >= 3: qs += 1
-        if vol_ratio >= 1.8: qs += 1
-        if rs >= 93: qs += 1
-        quality = "A" if qs >= 2 else "B" if qs >= 1 else "C"
+        if contractions >= 3:
+            qs += 1
+        if 1.5 <= vol_ratio <= 2.5:
+            qs += 1      # 黃金量比區間
+        elif vol_ratio > 2.5:
+            qs += 0      # 過高量比不加分（可能是出貨）
+        if rs >= 99:
+            qs += 2      # RS=99 額外加分
+        elif rs >= 93:
+            qs += 1
+        quality = "A" if qs >= 3 else "B" if qs >= 2 else "C"
 
-        ma50 = close.rolling(50).mean().iloc[-1]
+        # 進場訊號
+        ma50  = close.rolling(50).mean().iloc[-1]
         ma150 = close.rolling(150).mean().iloc[-1]
         ma200 = close.rolling(200).mean().iloc[-1]
-        last = close.iloc[-1]
+        last  = close.iloc[-1]
         buy_signal = (
             pd.notna(ma50) and pd.notna(ma150) and pd.notna(ma200) and
             last > ma200 and last > ma150 and ma150 > ma200 and last > ma50 and vol_ratio >= 1.2
@@ -345,34 +359,61 @@ def vcp_math_check(data):
             "contractions": contractions,
             "volume_ratio": round(float(vol_ratio), 2),
             "quality": quality,
-            "buy_signal": bool(buy_signal)
+            "buy_signal": bool(buy_signal),
+            "consecutive_days": 0,  # 預設值，由外部填入
         }
     except Exception as e:
         print(f"  VCP error: {e}")
         return None
 
-# ========== 新交易過濾器 (Step 3-4) ==========
+# ========== 新交易過濾器（回測優化版） ==========
 def apply_trade_filters(candidates):
-    """使用新黃金條件：量比 < 1.5 且 收縮 >= 17"""
+    """使用回測驗證的黃金條件：量比 < 1.5 且收縮 >= 17，加入連續入選與量比區間偏好"""
     market_bull, market_price = get_market_status()
     filtered = []
     for c in candidates:
         vol_ratio = c.get("volume_ratio", 0)
         contractions = c.get("contractions", 0)
+        consecutive = c.get("consecutive_days", 0)
 
-        if vol_ratio >= 1.5 or contractions < 17:
+        # 連續入選≥2天的股票，放寬條件
+        if consecutive >= 2:
+            if vol_ratio >= 1.3 and contractions >= 5 and c.get("rs_score", 0) >= 90:
+                c["market_bull"] = market_bull
+                c["market_price"] = market_price
+                filtered.append(c)
+                continue
+
+        # 黃金量比區間 1.5-2.5，表現最佳
+        if 1.5 <= vol_ratio <= 2.5:
+            if contractions >= 4 and c.get("rs_score", 0) >= 90:
+                c["market_bull"] = market_bull
+                c["market_price"] = market_price
+                filtered.append(c)
+                continue
+
+        # 高量比 >3.0，可能是出貨，提高門檻
+        if vol_ratio > 3.0:
+            if contractions >= 10 and c.get("rs_score", 0) >= 95:
+                c["market_bull"] = market_bull
+                c["market_price"] = market_price
+                filtered.append(c)
+                continue
+
+        # 標準 VCP 條件：量比 < 1.5 且收縮 >= 17（原有邏輯）
+        if vol_ratio < 1.5 and contractions >= 17:
+            c["market_bull"] = market_bull
+            c["market_price"] = market_price
+            filtered.append(c)
             continue
 
+        # 黑名單檢查
         symbol = c.get("symbol", "")
         if symbol in blacklist:
             past_status = blacklist[symbol]
             if past_status == -1:
                 if vol_ratio >= 1.5 or contractions < 20:
                     continue
-
-        c["market_bull"] = market_bull
-        c["market_price"] = market_price
-        filtered.append(c)
 
     return filtered
 
@@ -473,7 +514,7 @@ def build_report(total, results):
         msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
-# ========== API 端點（所有回傳皆經過 convert_numpy） ==========
+# ========== API 端點 ==========
 @app.get("/start_scan_async")
 def start_scan_async():
     global any_scan_running
