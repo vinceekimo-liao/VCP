@@ -46,6 +46,8 @@ def save_blacklist():
 # ========== 全域變數 ==========
 scan_results = []
 trade_signals = []
+sepa_stage2_candidates = []  # 新增：儲存符合 SEPA Stage 2 範本個股
+industry_map = {}            # 新增：股票代號 -> 產業名稱
 any_scan_running = False
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
@@ -75,59 +77,6 @@ def send_telegram_msg(message):
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         print(f"Telegram 發送失敗：{e}")
-
-def send_email_report(results, total_scanned):
-    if not RESEND_API_KEY:
-        print("⚠️ 未設定 RESEND_API_KEY，跳過 Email 寄送")
-        return
-    if not EMAIL_SENDER or not EMAIL_RECEIVER:
-        print("⚠️ 缺少 EMAIL_SENDER 或 EMAIL_RECEIVER，跳過寄送")
-        return
-    if not results:
-        print("⚠️ 無候選股票，不寄送 Email")
-        return
-
-    resend.api_key = RESEND_API_KEY
-
-    try:
-        df = pd.DataFrame(results)
-        df = df.sort_values("rs_score", ascending=False)
-        df = df.rename(columns={
-            "symbol": "代號", "price": "股價", "change_pct": "漲跌幅%",
-            "rs_score": "RS", "contractions": "收縮次數",
-            "volume_ratio": "量比", "quality": "品質",
-            "buy_signal": "進場訊號"
-        })
-
-        df_buy = df[df["進場訊號"] == True].copy()
-
-        filename = f"VCP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name="全部漏斗候選", index=False)
-            df_buy.to_excel(writer, sheet_name="最終進場訊號", index=False)
-
-        print(f"📁 Excel 檔案已產生：{filename} (全部 {len(df)} 檔，進場 {len(df_buy)} 檔)")
-
-        with open(filename, "rb") as f:
-            file_content = f.read()
-
-        attachment = {
-            "filename": filename,
-            "content": list(file_content)
-        }
-
-        params = {
-            "from": f"VCP 掃描器 <{EMAIL_SENDER}>",
-            "to": [EMAIL_RECEIVER],
-            "subject": f"📈 VCP 每日報告 {datetime.now().strftime('%Y-%m-%d')}",
-            "html": f"<p>今日共掃描 {total_scanned} 檔，符合漏斗條件 {len(df)} 檔，其中最終進場訊號 {len(df_buy)} 檔。<br>詳細請見附件。</p>",
-            "attachments": [attachment]
-        }
-        response = resend.Emails.send(params)
-        print(f"✅ Email 已寄送至 {EMAIL_RECEIVER}，Resend ID: {response['id']}")
-
-    except Exception as e:
-        print(f"❌ Email 寄送失敗：{type(e).__name__} - {str(e)}")
 
 def convert_numpy(obj):
     """遞迴將 numpy 型別轉為 Python 原生型別，確保 JSON 可序列化"""
@@ -165,9 +114,11 @@ def _wait_for_slot():
                 wait = oldest + REQUEST_WINDOW - now + 0.1
         time.sleep(wait)
 
-# ========== 股票清單、下載 ==========
+# ========== 股票清單與產業Mapping ==========
 _stock_ids_cache = {"ids": [], "ts": 0}
+
 def get_filtered_stock_ids():
+    global industry_map
     now = time.time()
     if _stock_ids_cache["ids"] and (now - _stock_ids_cache["ts"]) < 86400:
         return _stock_ids_cache["ids"]
@@ -181,6 +132,11 @@ def get_filtered_stock_ids():
                 raise ValueError("回傳空資料")
             info = info[~info["stock_name"].str.contains("權|ETF|存託憑證", na=False)]
             info = info[info["stock_id"].str.len() == 4]
+            
+            # 建立代號對應產業 Mapping
+            if "industry_category" in info.columns:
+                industry_map = dict(zip(info["stock_id"], info["industry_category"]))
+            
             ids = info["stock_id"].unique().tolist()
             _stock_ids_cache["ids"] = ids
             _stock_ids_cache["ts"] = now
@@ -217,7 +173,7 @@ def _get_col(data, *names):
             return data[n]
     return None
 
-# ========== 加權指數檢查 ==========
+# ========== 大盤健康度與加權指數檢查 ==========
 def get_market_status():
     try:
         df = fetch_daily("TAIEX", (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d"),
@@ -235,21 +191,21 @@ def get_market_status():
 # ========== 第一層：Minervini 完整 Stage 2 趨勢範本 ==========
 def minervini_check(data):
     if data is None or len(data) < 250:
-        return False
+        return False, None
         
     close = _get_col(data, "close", "Close")
     high  = _get_col(data, "max", "high", "High")
     low   = _get_col(data, "min", "low", "Low")
     
     if close is None or high is None or low is None:
-        return False
+        return False, None
         
     close = pd.to_numeric(close, errors='coerce').dropna()
     high  = pd.to_numeric(high,  errors='coerce').dropna()
     low   = pd.to_numeric(low,   errors='coerce').dropna()
     
     if len(close) < 250 or len(high) < 250 or len(low) < 250:
-        return False
+        return False, None
 
     try:
         ma50  = close.rolling(50).mean()
@@ -263,25 +219,41 @@ def minervini_check(data):
         
         # 1. 均線多頭排列
         if not (c_last > m50_last and m50_last > m150_last and m150_last > m200_last):
-            return False
+            return False, None
             
         # 2. 200MA 向上
         if m200_last <= ma200.iloc[-20]:
-            return False
+            return False, None
             
         # 3. 52 週高低點
         high_52w = high.tail(250).max()
         low_52w  = low.tail(250).min()
         
         if c_last < low_52w * 1.30:
-            return False
+            return False, None
             
         if c_last < high_52w * 0.75:
-            return False
+            return False, None
             
-        return True
+        pct_from_52w_high = round(float((c_last - high_52w) / high_52w * 100), 2)
+        pct_from_52w_low  = round(float((c_last - low_52w) / low_52w * 100), 2)
+        
+        stage2_info = {
+            "symbol": str(data["stock_id"].iloc[0]) if "stock_id" in data.columns else "",
+            "price": round(float(c_last), 2),
+            "ma50": round(float(m50_last), 2),
+            "ma150": round(float(m150_last), 2),
+            "ma200": round(float(m200_last), 2),
+            "high_52w": round(float(high_52w), 2),
+            "low_52w": round(float(low_52w), 2),
+            "pct_from_52w_high": pct_from_52w_high,
+            "pct_from_52w_low": pct_from_52w_low,
+            "near_52w_high": bool(c_last >= high_52w * 0.85)
+        }
+            
+        return True, stage2_info
     except Exception as e:
-        return False
+        return False, None
 
 # ========== 第二層：VCP 籌碼乾涸與動能爆量檢查 ==========
 def vcp_math_check(data):
@@ -362,8 +334,11 @@ def vcp_math_check(data):
             last > ma50 > ma150 > ma200
         )
 
+        sid = str(data["stock_id"].iloc[0]) if "stock_id" in data.columns else ""
+
         return {
-            "symbol": str(data["stock_id"].iloc[0]) if "stock_id" in data.columns else "",
+            "symbol": sid,
+            "industry": industry_map.get(sid, "其他"),
             "price": round(float(last), 2),
             "change_pct": round(float(today_change), 2),
             "rs_score": rs,
@@ -403,7 +378,7 @@ def apply_trade_filters(candidates):
         # 空頭防禦
         if not market_bull:
             if quality == "A" and vol_ratio >= 2.0 and rs_score >= 90:
-                c["filter_note"] = "空頭防禦性試探部位"
+                c["filter_note"] = "空頭防禦性試探部位 (5%~10%倉位)"
                 filtered.append(c)
             continue
 
@@ -427,6 +402,130 @@ def apply_trade_filters(candidates):
 
     return filtered
 
+# ========== SEPA + VCP 數據分析與 Excel / Email 產出 ==========
+def generate_and_send_sepa_vcp_report(results, total_scanned, stage2_list):
+    if not RESEND_API_KEY or not EMAIL_SENDER or not EMAIL_RECEIVER:
+        print("⚠️ 缺少 Resend 郵件設定，跳過 Email 寄送")
+        return
+
+    now_dt = datetime.now()
+    timestamp_str = now_dt.strftime("%Y%m%d%H%M%S")
+    date_str = now_dt.strftime("%Y-%m-%d %H:%M")
+
+    # 1. 整理各分頁資料集
+    df_all_vcp = pd.DataFrame(results) if results else pd.DataFrame()
+    df_stage2 = pd.DataFrame(stage2_list) if stage2_list else pd.DataFrame()
+
+    if not df_all_vcp.empty:
+        df_all_vcp = df_all_vcp.sort_values("rs_score", ascending=False)
+        df_buy_signals = df_all_vcp[df_all_vcp["buy_signal"] == True].copy()
+    else:
+        df_buy_signals = pd.DataFrame()
+
+    # 產業族群統計
+    group_summary_df = pd.DataFrame()
+    if not df_stage2.empty:
+        df_stage2["industry"] = df_stage2["symbol"].map(lambda x: industry_map.get(x, "其他"))
+        group_counts = df_stage2.groupby("industry").size().reset_index(name="強勢股數量")
+        group_counts = group_counts.sort_values("強勢股數量", ascending=False)
+        
+        # 標註領頭族群 (>=2 檔)
+        group_counts["族群狀態"] = group_counts["強勢股數量"].apply(lambda x: "🔥 領頭族群共振" if x >= 2 else "單兵強勢")
+        group_summary_df = group_counts
+
+    # 大盤與市場廣度簡報
+    market_bull, market_price = get_market_status()
+    near_52w_high_count = len([s for s in stage2_list if s.get("near_52w_high")]) if stage2_list else 0
+
+    breadth_summary = pd.DataFrame([{
+        "分析日期": date_str,
+        "總掃描股票數": total_scanned,
+        "Stage2趨勢範本合格數": len(stage2_list) if stage2_list else 0,
+        "接近52週高點數量(15%內)": near_52w_high_count,
+        "VCP選股符合數": len(results) if results else 0,
+        "最終黃金買點訊號數": len(df_buy_signals) if not df_buy_signals.empty else 0,
+        "加權指數價格": market_price,
+        "加權指數>20MA": "✅ 多頭" if market_bull else "⚠️ 震盪/空頭",
+        "建議部位風控": "正常進場 (10%~15%)" if market_bull else "嚴格防守/試倉 (5%~10%)"
+    }])
+
+    # 2. 寫入多頁籤 Excel：SEPA+VCP_yyyymmddhhmmss.xlsx
+    sepa_excel_filename = f"SEPA+VCP_{timestamp_str}.xlsx"
+    vcp_excel_filename = f"VCP_{now_dt.strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    try:
+        # 建立專屬 SEPA + VCP 報表
+        with pd.ExcelWriter(sepa_excel_filename, engine='openpyxl') as writer:
+            breadth_summary.to_excel(writer, sheet_name="大盤廣度與健康度簡報", index=False)
+            
+            if not df_buy_signals.empty:
+                df_buy_signals.to_excel(writer, sheet_name="SEPA+VCP 最終進場訊號", index=False)
+            else:
+                pd.DataFrame([{"訊息": "今日無最終進場訊號"}]).to_excel(writer, sheet_name="SEPA+VCP 最終進場訊號", index=False)
+
+            if not group_summary_df.empty:
+                group_summary_df.to_excel(writer, sheet_name="產業族群共振榜", index=False)
+
+            if not df_stage2.empty:
+                df_stage2.to_excel(writer, sheet_name="SEPA 趨勢範本合格池", index=False)
+
+            if not df_all_vcp.empty:
+                df_all_vcp.to_excel(writer, sheet_name="VCP 全漏斗候選", index=False)
+
+        # 保留原有的 VCP_yyyymmdd_hhmmss.xlsx 檔案格式以防外部引用
+        with pd.ExcelWriter(vcp_excel_filename, engine='openpyxl') as writer:
+            if not df_all_vcp.empty:
+                df_all_vcp.to_excel(writer, sheet_name="全部漏斗候選", index=False)
+                df_buy_signals.to_excel(writer, sheet_name="最終進場訊號", index=False)
+            else:
+                pd.DataFrame().to_excel(writer, sheet_name="全部漏斗候選")
+
+        print(f"📁 專業 SEPA+VCP 報表已建立：{sepa_excel_filename}")
+
+        # 3. 透過 Resend 發送 Email 附件
+        resend.api_key = RESEND_API_KEY
+        attachments = []
+
+        for fn in [sepa_excel_filename, vcp_excel_filename]:
+            if os.path.exists(fn):
+                with open(fn, "rb") as f:
+                    attachments.append({
+                        "filename": fn,
+                        "content": list(f.read())
+                    })
+
+        buy_count = len(df_buy_signals) if not df_buy_signals.empty else 0
+        html_content = f"""
+        <h2>📈 SEPA + VCP 每日量化交易系統分析報告</h2>
+        <p><b>分析時間：</b>{date_str}</p>
+        <ul>
+            <li><b>總掃描標的：</b>{total_scanned} 檔</li>
+            <li><b>Stage 2 趨勢範本符合：</b>{len(stage2_list) if stage2_list else 0} 檔</li>
+            <li><b>接近 52 週高點 (15%內)：</b>{near_52w_high_count} 檔</li>
+            <li><b>VCP 形態與籌碼合格：</b>{len(results) if results else 0} 檔</li>
+            <li><b>🔥 最終 SEPA+VCP 進場訊號：</b><b style='color:red;'>{buy_count} 檔</b></li>
+            <li><b>加權指數狀態：</b>{'多頭格局 (Risk-On)' if market_bull else '震盪/空頭防禦 (Risk-Off)'}</li>
+        </ul>
+        <p>詳細 SEPA 產業共振、大盤廣度與買點訊號請參閱附件 Excel 檔案：<b>{sepa_excel_filename}</b></p>
+        """
+
+        params = {
+            "from": f"SEPA+VCP 量化掃描器 <{EMAIL_SENDER}>",
+            "to": [EMAIL_RECEIVER],
+            "subject": f"🎯 SEPA+VCP 每日量化策略報告 {now_dt.strftime('%Y-%m-%d')} (進場訊號: {buy_count} 檔)",
+            "html": html_content,
+            "attachments": attachments
+        }
+        response = resend.Emails.send(params)
+        print(f"✅ 每日 SEPA+VCP Email 已成功寄送至 {EMAIL_RECEIVER}，Resend ID: {response['id']}")
+
+    except Exception as e:
+        print(f"❌ SEPA+VCP Email 寄送失敗：{type(e).__name__} - {str(e)}")
+
+def send_email_report(results, total_scanned):
+    """向下相容之原始呼叫入口"""
+    generate_and_send_sepa_vcp_report(results, total_scanned, sepa_stage2_candidates)
+
 # ========== 掃描執行器 ==========
 def _run_scan(scanner_func):
     global any_scan_running
@@ -447,81 +546,107 @@ def _run_scan(scanner_func):
 _manual_scan_status = {"running": False, "total": 0, "done": 0, "results": []}
 
 def manual_scanner():
-    global _manual_scan_status, scan_results, trade_signals
+    global _manual_scan_status, scan_results, trade_signals, sepa_stage2_candidates
     _manual_scan_status["running"] = True
     _manual_scan_status["done"] = 0
     _manual_scan_status["results"] = []
+    sepa_stage2_candidates = []
+    
     stocks = get_filtered_stock_ids()
     if not stocks:
         _manual_scan_status["running"] = False
         print("❌ 無股票清單，掃描終止")
         return
+        
     total = len(stocks)
     _manual_scan_status["total"] = total
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     end_date = datetime.today().strftime("%Y-%m-%d")
     layer1_pass = 0
+    
     for idx, sid in enumerate(stocks, 1):
         df = fetch_daily(sid, start_date, end_date)
-        if df is not None and minervini_check(df):
-            layer1_pass += 1
-            res = vcp_math_check(df)
-            if res:
-                res["symbol"] = sid
-                _manual_scan_status["results"].append(res)
+        if df is not None:
+            is_stage2, stage2_info = minervini_check(df)
+            if is_stage2:
+                layer1_pass += 1
+                if stage2_info:
+                    sepa_stage2_candidates.append(stage2_info)
+                res = vcp_math_check(df)
+                if res:
+                    res["symbol"] = sid
+                    _manual_scan_status["results"].append(res)
+                    
         _manual_scan_status["done"] = idx
         if idx % 100 == 0:
-            print(f"📊 進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(_manual_scan_status['results'])}")
+            print(f"📊 進度：{idx}/{total}，第一層 Stage2 通過：{layer1_pass}，VCP 候選：{len(_manual_scan_status['results'])}")
+            
     _manual_scan_status["running"] = False
     with scan_lock:
         scan_results = _manual_scan_status["results"]
     trade_signals = apply_trade_filters(scan_results)
-    send_email_report(scan_results, total)
-    print(f"✅ 手動掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
+    
+    # 執行包含 SEPA+VCP 分析的大盤與 Excel 寄送
+    generate_and_send_sepa_vcp_report(scan_results, total, sepa_stage2_candidates)
+    print(f"✅ 手動掃描完成，Stage2 通過：{layer1_pass} 檔，VCP 候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
 
 # ========== 夜間背景掃描 ==========
 def background_scanner():
-    global scan_results, last_report_msg, _manual_scan_status, trade_signals
+    global scan_results, last_report_msg, _manual_scan_status, trade_signals, sepa_stage2_candidates
     stocks = get_filtered_stock_ids()
     if not stocks:
         print("❌ 無股票清單，夜間掃描終止")
         return
+        
     total = len(stocks)
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
     end_date = datetime.today().strftime("%Y-%m-%d")
     local_results = []
+    local_stage2 = []
     layer1_pass = 0
+    
     for idx, sid in enumerate(stocks, 1):
         df = fetch_daily(sid, start_date, end_date)
-        if df is not None and minervini_check(df):
-            layer1_pass += 1
-            res = vcp_math_check(df)
-            if res:
-                local_results.append(res)
+        if df is not None:
+            is_stage2, stage2_info = minervini_check(df)
+            if is_stage2:
+                layer1_pass += 1
+                if stage2_info:
+                    local_stage2.append(stage2_info)
+                res = vcp_math_check(df)
+                if res:
+                    local_results.append(res)
+                    
         if idx % 100 == 0:
-            print(f"📊 背景掃描進度：{idx}/{total}，第一層通過：{layer1_pass}，候選：{len(local_results)}")
+            print(f"📊 背景掃描進度：{idx}/{total}，Stage2 通過：{layer1_pass}，VCP 候選：{len(local_results)}")
+            
     with scan_lock:
         scan_results = local_results
+        sepa_stage2_candidates = local_stage2
+        
     _manual_scan_status["running"] = False
     _manual_scan_status["total"] = total
     _manual_scan_status["done"] = total
     _manual_scan_status["results"] = local_results
+    
     last_report_msg = build_report(total, scan_results)
     send_telegram_msg(last_report_msg)
     trade_signals = apply_trade_filters(scan_results)
-    send_email_report(scan_results, total)
-    print(f"✅ 背景掃描完成，第一層通過：{layer1_pass} 檔，最終候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
+    
+    # 執行包含 SEPA+VCP 分析的大盤與 Excel 寄送
+    generate_and_send_sepa_vcp_report(scan_results, total, sepa_stage2_candidates)
+    print(f"✅ 背景掃描完成，Stage2 通過：{layer1_pass} 檔，VCP 候選：{len(scan_results)} 檔，交易訊號：{len(trade_signals)} 檔")
 
 def build_report(total, results):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     if not results:
         return f"📉 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，無符合條件股票"
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-    msg = f"📈 <b>每日 VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
+    msg = f"📈 <b>每日 SEPA+VCP 報告 ({now_str})</b>\n掃描 {total} 檔，符合 {len(results)} 檔\n\n"
     for i, c in enumerate(sorted_results[:15], 1):
         symbol = c['symbol']
         yahoo_link = f"https://tw.stock.yahoo.com/quote/{symbol}"
-        msg += f"🔹 <b>{symbol}</b> | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
+        msg += f"🔹 <b>{symbol}</b> ({c.get('industry','其他')}) | 價:{c['price']} | RS:{c['rs_score']} | 品質:{c['quality']} <a href='{yahoo_link}'>📈 Yahoo</a>\n"
     return msg
 
 # ========== API 端點 ==========
@@ -584,7 +709,7 @@ def send_report():
         current = scan_results
     last_report_msg = msg
     send_telegram_msg(msg)
-    send_email_report(current, total)
+    generate_and_send_sepa_vcp_report(current, total, sepa_stage2_candidates)
     return {"status": "report sent"}
 
 @app.get("/latest_report")
@@ -609,7 +734,7 @@ def full_report():
     if not results:
         return HTMLResponse(content="<html><body><h2>尚無篩選結果</h2></body></html>")
     sorted_results = sorted(results, key=lambda x: -x["rs_score"])
-    html = f"""<html><head><meta charset='utf-8'><title>VCP 完整報告</title>
+    html = f"""<html><head><meta charset='utf-8'><title>SEPA+VCP 完整報告</title>
     <style>
         body {{ background: #060d16; color: #e2f0ff; font-family: sans-serif; padding: 20px; }}
         table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
@@ -617,12 +742,13 @@ def full_report():
         td {{ padding: 6px; border-bottom: 1px solid #1a2d40; }}
         a {{ color: #38bdf8; }}
     </style></head><body>
-    <h2>📈 VCP 完整篩選報告</h2>
-    <p>掃描 {total} 檔，符合 {len(sorted_results)} 檔</p>
-    <table><tr><th>代號</th><th>股價</th><th>漲跌%</th><th>RS</th><th>收縮次數</th><th>量比</th><th>品質</th><th>進場訊號</th><th>Yahoo</th></tr>"""
+    <h2>📈 SEPA + VCP 完整篩選報告</h2>
+    <p>掃描 {total} 檔，符合 VCP 形態 {len(sorted_results)} 檔</p>
+    <table><tr><th>代號</th><th>產業</th><th>股價</th><th>漲跌%</th><th>RS</th><th>收縮次數</th><th>量比</th><th>品質</th><th>進場訊號</th><th>Yahoo</th></tr>"""
     for c in sorted_results:
         buy_icon = "✅" if c.get("buy_signal") else "❌"
-        html += f"<tr><td>{c['symbol']}</td><td>{c['price']}</td><td>{c['change_pct']:+.2f}%</td><td>{c['rs_score']}</td><td>{c['contractions']}</td><td>{c['volume_ratio']}</td><td>{c['quality']}</td><td>{buy_icon}</td><td><a href='https://tw.stock.yahoo.com/quote/{c['symbol']}' target='_blank'>Yahoo</a></td></tr>"
+        ind = c.get("industry", "其他")
+        html += f"<tr><td>{c['symbol']}</td><td>{ind}</td><td>{c['price']}</td><td>{c['change_pct']:+.2f}%</td><td>{c['rs_score']}</td><td>{c['contractions']}</td><td>{c['volume_ratio']}</td><td>{c['quality']}</td><td>{buy_icon}</td><td><a href='https://tw.stock.yahoo.com/quote/{c['symbol']}' target='_blank'>Yahoo</a></td></tr>"
     html += "</table></body></html>"
     return HTMLResponse(content=html)
 
@@ -639,19 +765,19 @@ def get_trade_signals():
     return convert_numpy({
         "market_bull": market_bull,
         "market_price": market_price,
-        "suggestion": "暫停進場，或只投 1/3 資金" if not market_bull else "可正常進場",
+        "suggestion": "暫停進場，或只投 5%~10% 防禦性試倉" if not market_bull else "可正常進場 (10%~15%)",
         "candidates": trade_signals,
         "entry_tips": [
             "⚠️ 開盤觀察 (9:00-10:00)：若開盤即跌破篩選日最低價 → 刪除",
             "⚠️ 若開盤跳空大漲 (>5%) → 觀望不追（可能已過高點）",
             "✅ 若開盤平穩或小幅上漲 → 10:00 後進場",
             "✅ 進場價：不超過篩選日收盤價 +2%",
-            "✅ 倉位：單檔不超過 1/5 資金"
+            "✅ 倉位：試倉 5%~10%，獲利後才加碼"
         ],
         "exit_tips": [
-            "停利：+5% 或持有 3 天後評估",
-            "停損：-3% 或跌破篩選日最低價",
-            "時間停損：5 天未達 +3% 即出場"
+            "停利：+5% 或持有 3 天後評估移動停利",
+            "停損：硬性 7%~8% 或跌破關鍵樞紐低點",
+            "時間停損：5 天未達 +3% 即出場離場"
         ]
     })
 
