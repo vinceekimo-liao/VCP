@@ -9,11 +9,27 @@ import pandas as pd
 import numpy as np
 import requests
 import resend
-from scipy.signal import argrelextrema
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from FinMind.data import DataLoader
+
+# ========== 純 NumPy 替代 SciPy 極值算子 ==========
+def argrelextrema(data, comparator, order=1, mode='clip'):
+    """純 NumPy 實作之相對極值尋找函式（替代 scipy.signal.argrelextrema）"""
+    data = np.asarray(data)
+    datalen = len(data)
+    locs = np.arange(0, datalen)
+    results = np.ones(datalen, dtype=bool)
+    main = np.take(data, locs, mode=mode)
+    for shift in range(1, order + 1):
+        plus = np.take(data, locs + shift, mode=mode)
+        minus = np.take(data, locs - shift, mode=mode)
+        results &= comparator(main, plus)
+        results &= comparator(main, minus)
+        if not results.any():
+            return (np.array([], dtype=int),)
+    return (np.nonzero(results)[0],)
 
 app = FastAPI()
 app.add_middleware(
