@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import requests
 import resend
+from scipy.signal import argrelextrema
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -46,8 +47,8 @@ def save_blacklist():
 # ========== 全域變數 ==========
 scan_results = []
 trade_signals = []
-sepa_stage2_candidates = []  # 新增：儲存符合 SEPA Stage 2 範本個股
-industry_map = {}            # 新增：股票代號 -> 產業名稱
+sepa_stage2_candidates = []  # 儲存符合 SEPA Stage 2 範本個股
+industry_map = {}            # 股票代號 -> 產業名稱
 any_scan_running = False
 scan_lock = threading.Lock()
 last_report_msg = "尚無報告"
@@ -114,7 +115,7 @@ def _wait_for_slot():
                 wait = oldest + REQUEST_WINDOW - now + 0.1
         time.sleep(wait)
 
-# ========== 股票清單與產業Mapping ==========
+# ========== 股票清單與產業 Mapping ==========
 _stock_ids_cache = {"ids": [], "ts": 0}
 
 def get_filtered_stock_ids():
@@ -255,11 +256,13 @@ def minervini_check(data):
     except Exception as e:
         return False, None
 
-# ========== 第二層：VCP 籌碼乾涸與動能爆量檢查 ==========
+# ========== 第二層：修訂版 VCP 收縮演算法與動能突破判斷 ==========
 def vcp_math_check(data):
+    # VCP 型態建構通常需要 3~6 個月，資料量建議至少 120 根 K 線
     if data is None or len(data) < 120:
         return None
 
+    # 1. 資料欄位清洗與轉換
     close  = pd.to_numeric(_get_col(data, "close", "Close"), errors='coerce')
     high   = pd.to_numeric(_get_col(data, "max", "high", "High"), errors='coerce')
     low    = pd.to_numeric(_get_col(data, "min", "low", "Low"), errors='coerce')
@@ -269,34 +272,68 @@ def vcp_math_check(data):
     if len(df_clean) < 120:
         return None
 
-    c = df_clean["close"]
-    h = df_clean["high"]
-    l = df_clean["low"]
-    v = df_clean["volume"]
+    c = df_clean["close"].reset_index(drop=True)
+    h = df_clean["high"].reset_index(drop=True)
+    l = df_clean["low"].reset_index(drop=True)
+    v = df_clean["volume"].reset_index(drop=True)
 
     try:
-        # 1. 量比
+        # 2. 技術指標計算 (量比與 VDU)
         vol_ma20 = v.rolling(20).mean()
         if pd.isna(vol_ma20.iloc[-1]) or vol_ma20.iloc[-1] == 0:
             return None
         vol_ratio = v.iloc[-1] / vol_ma20.iloc[-1]
 
-        # 2. VDU
-        vdu_flag = v.iloc[-4:-1].mean() < (vol_ma20.iloc[-1] * 0.85)
+        # VDU (Volume Dry-Up)：突破前 3 天量能嚴重窒息，要求低於 20MA 的 65%
+        vdu_flag = v.iloc[-4:-1].mean() < (vol_ma20.iloc[-1] * 0.65)
 
-        # 3. VCP 收縮
-        range_t1 = (h.iloc[-40:-20].max() - l.iloc[-40:-20].min()) / l.iloc[-40:-20].min()
-        range_t2 = (h.iloc[-20:-1].max() - l.iloc[-20:-1].min()) / l.iloc[-20:-1].min()
-        vcp_contracting = range_t1 > range_t2
+        # 3. 動態尋找波段轉折點 (VCP核心邏輯)
+        order_days = 5  # 前後 5 天最高/最低視為一個區域轉折點
+        peaks_idx = argrelextrema(h.values, np.greater, order=order_days)[0]
+        valleys_idx = argrelextrema(l.values, np.less, order=order_days)[0]
 
-        contractions = 3 if (vcp_contracting and vdu_flag) else (2 if vcp_contracting else 1)
+        # 僅觀察最近 80 天內形成的型態
+        recent_limit = len(df_clean) - 80
+        peaks_idx = [p for p in peaks_idx if p > recent_limit]
+        valleys_idx = [v_idx for v_idx in valleys_idx if v_idx > recent_limit]
 
-        # 4. 樞紐突破
+        # 配對轉折點，計算每次回檔（從高點到隨後最低點的跌幅）
+        pullbacks = []
+        for p_idx in peaks_idx:
+            sub_valleys = [v_idx for v_idx in valleys_idx if v_idx > p_idx]
+            if sub_valleys:
+                v_idx = sub_valleys[0]
+                peak_p = h.iloc[p_idx]
+                valley_p = l.iloc[v_idx]
+                
+                # 正確的 VCP 回檔幅度公式：(高 - 低) / 高
+                drop_pct = (peak_p - valley_p) / peak_p * 100
+                pullbacks.append(round(drop_pct, 2))
+
+        # 驗證收縮邏輯：後次的波動幅度必須比前次小
+        vcp_contracting = False
+        contractions = len(pullbacks)
+
+        if contractions >= 2:
+            if pullbacks[-2] > pullbacks[-1]:
+                if contractions >= 3:
+                    vcp_contracting = pullbacks[-3] > pullbacks[-2]
+                else:
+                    vcp_contracting = True
+
+        # 如果轉折點抓取雜訊導致次數異常（通常 VCP 不會超過 5 次收縮）
+        if contractions > 5:
+            vcp_contracting = False
+
+        # 4. 樞紐突破 (Pivot Breakout)
         today_change = ((c.iloc[-1] - c.iloc[-2]) / c.iloc[-2] * 100) if len(c) >= 2 else 0
-        pivot_high = h.iloc[-20:-1].max()
-        is_pivot_breakout = c.iloc[-1] >= pivot_high * 0.99
+        # 樞紐高點定義為最近一次收縮的高點
+        pivot_high = h.iloc[peaks_idx[-1]] if len(peaks_idx) > 0 else h.iloc[-20:-1].max()
+        
+        # 突破訊號：今日收盤價必須站上樞紐高點的 99% 以上，且當天是收紅K
+        is_pivot_breakout = (c.iloc[-1] >= pivot_high * 0.99) and (c.iloc[-1] >= c.iloc[-2])
 
-        # 5. RS
+        # 5. 相對強度 (RS) 門檻
         rs_lookback = min(60, len(c))
         past_close = c.iloc[-rs_lookback]
         if past_close <= 0:
@@ -304,31 +341,34 @@ def vcp_math_check(data):
         rs_raw = 50 + (c.iloc[-1] - past_close) / past_close * 200
         rs = int(max(1, min(99, round(float(rs_raw)))))
 
-        if rs < 85 or vol_ratio < 1.5:
+        # 篩選核心強勢股門檻
+        if rs < 85 or vol_ratio < 1.3:
             return None
 
-        # 6. 品質評分
+        # 6. 品質評分 (Quality Score)
         qs = 0
-        if 1.8 <= vol_ratio <= 3.0:
+        if 1.5 <= vol_ratio <= 3.0:  # 突破當天量能溫和放大
             qs += 2
-        elif vol_ratio > 3.0:
+        elif vol_ratio > 3.0:        # 爆量突破
             qs += 1
-        if vdu_flag:
+        if vdu_flag:                 # 伴隨量能窒息
             qs += 1
-        if vcp_contracting:
-            qs += 1
-        if rs >= 95:
+        if vcp_contracting:          # 具備完美的遞減收縮
+            qs += 2
+        if rs >= 95:                 # 強勢股加分
             qs += 1
 
-        quality = "A" if qs >= 4 else "B" if qs >= 2 else "C"
+        quality = "A" if qs >= 5 else "B" if qs >= 3 else "C"
 
-        # 7. 進場訊號
+        # 7. 趨勢樣板與進場訊號 (Trend Template)
         ma50  = c.rolling(50).mean().iloc[-1]
         ma150 = c.rolling(150).mean().iloc[-1]
         ma200 = c.rolling(200).mean().iloc[-1]
         last  = c.iloc[-1]
 
+        # 必須處於多頭排列，且具備收縮型態、完成樞紐突破與量能放大
         buy_signal = (
+            vcp_contracting and
             is_pivot_breakout and
             vol_ratio >= 1.5 and
             last > ma50 > ma150 > ma200
@@ -342,12 +382,13 @@ def vcp_math_check(data):
             "price": round(float(last), 2),
             "change_pct": round(float(today_change), 2),
             "rs_score": rs,
-            "contractions": contractions,
+            "contractions": contractions if vcp_contracting else 0, # 不符合收縮則次數歸零
             "volume_ratio": round(float(vol_ratio), 2),
             "vdu": vdu_flag,
             "quality": quality,
             "buy_signal": bool(buy_signal),
             "consecutive_days": 0,
+            "pullback_history": str(pullbacks) # 額外輸出回檔紀錄字串，方便 Excel 檢視
         }
     except Exception as e:
         print(f"  VCP error: {e}")
