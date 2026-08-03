@@ -5,9 +5,9 @@ import os
 import threading
 import time
 
-from FastAPI import FastAPI, Query
-from FastAPI.middleware.cors import CORSMiddleware
-from FastAPI.responses import HTMLResponse
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from FinMind.data import DataLoader
 import numpy as np
 import pandas as pd
@@ -283,7 +283,7 @@ def minervini_check(data):
     if c_last < low_52w * 1.30:  # 反彈需自低點達 30% 以上
       return False, None
 
-    if c_last < high_52w * 0.75:  # 距離 52 週高點須在 25% 依內
+    if c_last < high_52w * 0.75:  # 距離 52 週高點須在 25% 以內
       return False, None
 
     pct_from_52w_high = round(float((c_last - high_52w) / high_52w * 100), 2)
@@ -309,12 +309,11 @@ def minervini_check(data):
     return False, None
 
 
-# ========== 第二層：修訂版 VCP 收縮演算法與動能突破判斷 (重構修正版) ==========
+# ========== 第二層：VCP 收縮演算法與動能突破判斷 ==========
 def vcp_math_check(data):
   if data is None or len(data) < 120:
     return None
 
-  # 1. 資料清洗
   close = pd.to_numeric(_get_col(data, 'close', 'Close'), errors='coerce')
   high = pd.to_numeric(_get_col(data, 'max', 'high', 'High'), errors='coerce')
   low = pd.to_numeric(_get_col(data, 'min', 'low', 'Low'), errors='coerce')
@@ -334,7 +333,6 @@ def vcp_math_check(data):
   v = df_clean['volume'].reset_index(drop=True)
 
   try:
-    # 2. 技術指標與 VDU 量能窒息驗證
     vol_ma20 = v.rolling(20).mean()
     if pd.isna(vol_ma20.iloc[-1]) or vol_ma20.iloc[-1] == 0:
       return None
@@ -343,7 +341,6 @@ def vcp_math_check(data):
     # VDU (Volume Dry-Up)：突破前 3 天均量須小於 20MA 的 65%
     vdu_flag = v.iloc[-4:-1].mean() < (vol_ma20.iloc[-1] * 0.65)
 
-    # 3. 轉折點計算與降噪 (order=5)
     order_days = 5
     peaks_idx = argrelextrema(h.values, np.greater, order=order_days)[0]
     valleys_idx = argrelextrema(l.values, np.less, order=order_days)[0]
@@ -352,7 +349,6 @@ def vcp_math_check(data):
     peaks_idx = [p for p in peaks_idx if p > recent_limit]
     valleys_idx = [v_idx for v_idx in valleys_idx if v_idx > recent_limit]
 
-    # 配對 Peak -> Trough 計算回檔
     pullbacks = []
     for p_idx in peaks_idx:
       sub_valleys = [
@@ -368,7 +364,6 @@ def vcp_math_check(data):
         drop_pct = (peak_p - valley_p) / peak_p * 100
         pullbacks.append(round(drop_pct, 2))
 
-    # 4. 嚴格 VCP 幅度遞減 + 最後一次收縮緊密度上限 (T_last <= 10%)
     vcp_contracting = False
     contractions = len(pullbacks)
 
@@ -377,15 +372,13 @@ def vcp_math_check(data):
       if contractions >= 3:
         is_decreasing = is_decreasing and (pullbacks[-3] > pullbacks[-2])
 
-      # 修正點 1：最後一次收縮幅度不能過於鬆散，必須 <= 10.0%
+      # 最後一次收縮幅度必須 <= 10.0%
       is_tight = pullbacks[-1] <= 10.0
-
       vcp_contracting = is_decreasing and is_tight
 
     if contractions > 5:
       vcp_contracting = False
 
-    # 5. 精確樞買點突破 (Pivot Breakout) 與延伸防追高過伸
     today_change = (
         ((c.iloc[-1] - c.iloc[-2]) / c.iloc[-2] * 100) if len(c) >= 2 else 0
     )
@@ -393,12 +386,11 @@ def vcp_math_check(data):
         h.iloc[peaks_idx[-1]] if len(peaks_idx) > 0 else h.iloc[-20:-1].max()
     )
 
-    # 修正點 2：收盤價必須站上 Pivot High，且不超過 Pivot High 的 3% (避免過伸)
+    # 必須站上 Pivot High 且不超過 3%
     is_pivot_breakout = (c.iloc[-1] >= pivot_high) and (
         c.iloc[-1] <= pivot_high * 1.03
     )
 
-    # 6. 動能評估 (60日動能與 RS 參考)
     rs_lookback = min(60, len(c))
     past_close = c.iloc[-rs_lookback]
     if past_close <= 0:
@@ -410,7 +402,6 @@ def vcp_math_check(data):
     if rs < 85 or vol_ratio < 1.3:
       return None
 
-    # 7. 品質評分 (Quality Score)
     qs = 0
     if 1.5 <= vol_ratio <= 3.0:
       qs += 2
@@ -425,7 +416,6 @@ def vcp_math_check(data):
 
     quality = 'A' if qs >= 5 else 'B' if qs >= 3 else 'C'
 
-    # 8. 多頭排列與進場訊號觸發
     ma50 = c.rolling(50).mean().iloc[-1]
     ma150 = c.rolling(150).mean().iloc[-1]
     ma200 = c.rolling(200).mean().iloc[-1]
@@ -434,7 +424,7 @@ def vcp_math_check(data):
     buy_signal = (
         vcp_contracting
         and is_pivot_breakout
-        and (vol_ratio >= 1.4)  # 突破當日放量達 1.4 倍
+        and (vol_ratio >= 1.4)
         and (last > ma50 > ma150 > ma200)
     )
 
@@ -484,14 +474,12 @@ def apply_trade_filters(candidates):
     c['market_bull'] = market_bull
     c['market_price'] = market_price
 
-    # 空頭防禦情境
     if not market_bull:
       if quality == 'A' and vol_ratio >= 2.0 and rs_score >= 90:
         c['filter_note'] = '空頭防禦性試探部位 (5%~10%倉位)'
         filtered.append(c)
       continue
 
-    # 多頭情境
     if consecutive >= 2 and vol_ratio >= 1.3:
       c['filter_note'] = '動能持續加碼股'
       filtered.append(c)
@@ -726,7 +714,9 @@ def manual_scanner():
     scan_results = _manual_scan_status['results']
   trade_signals = apply_trade_filters(scan_results)
 
-  generate_and_send_sepa_vcp_report(scan_results, total, sepa_stage2_candidates)
+  generate_and_send_sepa_vcp_report(
+      scan_results, total, sepa_stage2_candidates
+  )
   print(
       f'✅ 手動掃描完成，Stage2 通過：{layer1_pass} 檔，VCP 候選：{len(scan_results)}'
       f' 檔，交易訊號：{len(trade_signals)} 檔'
@@ -735,13 +725,7 @@ def manual_scanner():
 
 # ========== 夜間背景掃描 ==========
 def background_scanner():
-  global (
-      scan_results,
-      last_report_msg,
-      _manual_scan_status,
-      trade_signals,
-      sepa_stage2_candidates,
-  )
+  global scan_results, last_report_msg, _manual_scan_status, trade_signals, sepa_stage2_candidates
   stocks = get_filtered_stock_ids()
   if not stocks:
     print('❌ 無股票清單，夜間掃描終止')
@@ -785,7 +769,9 @@ def background_scanner():
   send_telegram_msg(last_report_msg)
   trade_signals = apply_trade_filters(scan_results)
 
-  generate_and_send_sepa_vcp_report(scan_results, total, sepa_stage2_candidates)
+  generate_and_send_sepa_vcp_report(
+      scan_results, total, sepa_stage2_candidates
+  )
   print(
       f'✅ 背景掃描完成，Stage2 通過：{layer1_pass} 檔，VCP 候選：{len(scan_results)}'
       f' 檔，交易訊號：{len(trade_signals)} 檔'
